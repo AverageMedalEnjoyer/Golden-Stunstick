@@ -1,0 +1,36 @@
+﻿[package]
+name = "golden-stunstick"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.100"
+description = "Golden Stunstick - a Source engine modding workbench (animator, model viewer, compiler & decompiler)"
+license = "CC0-1.0"
+build = "build.rs"
+
+[[bin]]
+name = "GoldenStunstick"
+path = "src/main.rs"
+
+[dependencies]
+eframe = { version = "0.37", default-features = false, features = ["default_fonts", "glow", "persistence"] }
+glam = "0.34"
+rfd = "0.18"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "tga"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+
+[build-dependencies]
+image = { version = "0.25", default-features = false, features = ["png"] }
+winresource = "0.1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 4
+strip = true
+panic = "unwind"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3

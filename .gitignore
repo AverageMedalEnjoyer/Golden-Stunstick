@@ -66,3 +66,10 @@ vcpkg_installed/
 # test output & cache
 Testing/
 .cache/
+
+# Rust
+/target/
+**/*.rs.bk
+
+# Golden Stunstick runtime data (created next to the EXE)
+goldenstunstick_files/

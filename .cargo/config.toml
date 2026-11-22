@@ -1,0 +1,7 @@
+# Link the C runtime statically on Windows so GoldenStunstick.exe runs on a
+# clean machine without the Visual C++ redistributable.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.i686-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

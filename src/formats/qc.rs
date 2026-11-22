@@ -1,4 +1,4 @@
-﻿//! QC tokenizer and lightweight parser.
+//! QC tokenizer and lightweight parser.
 //!
 //! Used by the Animator (to find a model's reference meshes, materials and
 //! skeleton) and by the Compiler (to lint a QC before handing it to

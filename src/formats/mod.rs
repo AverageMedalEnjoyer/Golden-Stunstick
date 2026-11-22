@@ -1,4 +1,4 @@
-﻿pub mod bin;
+pub mod bin;
 pub mod dmx;
 pub mod keyvalues;
 pub mod mdl;

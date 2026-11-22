@@ -1,4 +1,4 @@
-﻿//! Model Viewer tab: an HLMV++-style viewer for models in the mounted game.
+//! Model Viewer tab: an HLMV++-style viewer for models in the mounted game.
 
 use crate::app::Shared;
 use crate::gamefs::{GameFs, ModelEntry};
@@ -192,7 +192,7 @@ impl ModelViewerTab {
     fn on_loaded(&mut self, s: ModelScene, sh: &mut Shared) {
         let m = s.main();
         self.bodygroups = vec![0; m.bodyparts.len()];
-        self.pose_params = m.pose_params.iter().map(|p| if p.start <= 0.0 && p.end >= 0.0 { 0.0 } else { (p.start + p.end) * 0.5 }).collect();
+        self.pose_params = s.pose_params.iter().map(default_pose_value).collect();
         self.flex_values = m.flex_controllers.iter().map(|_| 0.0).collect();
         self.skin = 0;
         self.lod = 0;
@@ -248,6 +248,24 @@ impl ModelViewerTab {
     }
 
     /// Start loading a model from the mounted game (used by the --model command line option).
+    /// Pick the bottom panel by name (`--viewer-page`): render, sequence, body, flexes,
+    /// bones, attachments, hitboxes, physics, bonemerge, materials, info.
+    pub fn set_panel(&mut self, name: &str) {
+        self.panel = match name.to_ascii_lowercase().as_str() {
+            "sequence" => Panel::Sequence,
+            "body" => Panel::Body,
+            "flexes" => Panel::Flexes,
+            "bones" => Panel::Bones,
+            "attachments" => Panel::Attachments,
+            "hitboxes" => Panel::Hitboxes,
+            "physics" => Panel::Physics,
+            "bonemerge" => Panel::Merge,
+            "materials" => Panel::Materials,
+            "info" => Panel::Info,
+            _ => Panel::Render,
+        };
+    }
+
     pub fn request_model(&mut self, sh: &Shared, path: &str, seq: Option<String>) {
         self.wanted_seq = seq;
         self.loading_label = path.to_string();
@@ -445,7 +463,7 @@ impl ModelViewerTab {
                     }
                     for (i, (name, c)) in PAINTS.iter().enumerate() {
                         let col = Color32::from_rgb(c[0], c[1], c[2]);
-                        let r = ui.add(egui::Button::new(RichText::new("■").color(col)).selected(self.paint == Some(i))).on_hover_text(*name);
+                        let r = ui.add(egui::Button::image(sh.dot(col, 14.0)).selected(self.paint == Some(i))).on_hover_text(*name);
                         if r.clicked() {
                             self.paint = Some(i);
                             self.use_custom_paint = false;
@@ -636,7 +654,7 @@ impl ModelViewerTab {
                     row("Attachments", format!("{}", m.attachments.len()));
                     row("Hitbox sets", format!("{}", m.hitbox_sets.len()));
                     row("Flexes / controllers", format!("{} / {}", m.flex_descs.len(), m.flex_controllers.len()));
-                    row("Pose parameters", m.pose_params.iter().map(|p| p.name.clone()).collect::<Vec<_>>().join(", "));
+                    row("Pose parameters", scene.pose_params.iter().map(|p| format!("{} [{} .. {}]", p.name, p.start, p.end)).collect::<Vec<_>>().join(", "));
                     row("IK chains", m.ik_chains.iter().map(|p| p.name.clone()).collect::<Vec<_>>().join(", "));
                     row("Include models", m.include_models.iter().map(|p| p.name.clone()).collect::<Vec<_>>().join(", "));
                     row("Surface prop", m.surfaceprop.clone());
@@ -705,15 +723,25 @@ impl ModelViewerTab {
                 ui.label(RichText::new("* = from an $includemodel").small().weak());
             });
             ui.vertical(|ui| {
-                let m = scene.main();
-                if !m.pose_params.is_empty() {
-                    ui.label(RichText::new("Pose parameters").strong());
-                    for (i, p) in m.pose_params.iter().enumerate() {
-                        if let Some(v) = self.pose_params.get_mut(i) {
-                            let (a, b) = if p.start <= p.end { (p.start, p.end) } else { (p.end, p.start) };
-                            ui.add(egui::Slider::new(v, a..=b.max(a + 0.001)).text(&p.name));
+                if !scene.pose_params.is_empty() {
+                    let used = scene.sequence_pose_params(self.seq);
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Pose parameters").strong());
+                        if ui.small_button("Reset").clicked() {
+                            self.pose_params = scene.pose_params.iter().map(default_pose_value).collect();
                         }
-                    }
+                    });
+                    egui::Grid::new("pose_params").num_columns(3).spacing([8.0, 2.0]).show(ui, |ui| {
+                        for (i, p) in scene.pose_params.iter().enumerate() {
+                            let Some(v) = self.pose_params.get_mut(i) else { continue };
+                            let (a, b) = if p.start <= p.end { (p.start, p.end) } else { (p.end, p.start) };
+                            let name = RichText::new(&p.name);
+                            ui.label(if used.contains(&i) { name.strong() } else { name.weak() }).on_hover_text(if used.contains(&i) { "Used by this sequence or its layers" } else { "Not used by this sequence" });
+                            ui.add(egui::Slider::new(v, a..=b.max(a + 0.001)).show_value(false));
+                            ui.add(egui::DragValue::new(v).range(a..=b).speed((b - a) / 200.0).max_decimals(2));
+                            ui.end_row();
+                        }
+                    });
                 }
                 if let Some(sr) = scene.seqs.get(self.seq) {
                     let src = &scene.sources[sr.source];
@@ -981,4 +1009,11 @@ impl ModelViewerTab {
         }
         let _ = Quat::IDENTITY;
     }
+}
+
+/// Starting value for a pose parameter: 0 when it is in range (HLMV does the same),
+/// otherwise the middle of the range.
+fn default_pose_value(p: &crate::formats::mdl::PoseParam) -> f32 {
+    let (a, b) = if p.start <= p.end { (p.start, p.end) } else { (p.end, p.start) };
+    if a <= 0.0 && b >= 0.0 { 0.0 } else { (a + b) * 0.5 }
 }

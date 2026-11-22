@@ -1,4 +1,4 @@
-﻿//! Animator core: a QC-based rig (skeleton + reference meshes from SMDs), the
+//! Animator core: a QC-based rig (skeleton + reference meshes from SMDs), the
 //! keyframed animation document, interpolation / easing / crossfades, the
 //! "easy rig" IK chains, TXT save/load and SMD / DMX export.
 
@@ -193,59 +193,148 @@ pub fn detect_chains(rig: &Rig) -> Vec<IkChain> {
         let kind = if is_hand { "arm" } else { "leg" };
         out.push(IkChain { name: format!("{side} {kind} ({})", b.name).trim().to_string(), bones: chain, enabled: true });
     }
+    // a "wrist" helper next to a real "hand" on the same forearm (Valve biped) is not a limb
+    let lower = |c: &IkChain| c.bones.get(c.bones.len().wrapping_sub(2)).copied();
+    let hands: Vec<Option<usize>> = out.iter().filter(|c| has_any(&rig.bones[*c.bones.last().unwrap()].name, &["hand"])).map(lower).collect();
+    out.retain(|c| {
+        let eff = &rig.bones[*c.bones.last().unwrap()].name;
+        !(has_any(eff, &["wrist"]) && !has_any(eff, &["hand"]) && hands.contains(&lower(c)))
+    });
     out
 }
 
-/// CCD IK: move the chain's effector toward `target` (world space), keeping the
-/// effector's world rotation. Modifies the local pose in place.
-pub fn solve_ik(rig: &Rig, pose: &mut [(Vec3, Quat)], chain: &[usize], target: Vec3) {
-    let Some(&effector) = chain.last() else { return };
-    let eff_world_rot = {
-        let w = rig.world(pose);
-        let (_, r, _) = w[effector].to_scale_rotation_translation();
-        r
+fn rot_of(a: &Affine3A) -> Quat {
+    a.to_scale_rotation_translation().1.normalize()
+}
+
+fn any_perpendicular(v: Vec3) -> Vec3 {
+    let o = if v.x.abs() < 0.9 { Vec3::X } else { Vec3::Y };
+    v.cross(o).normalize_or(Vec3::Z)
+}
+
+/// Rotation taking the frame (x1 along, z1 hinge) onto (x2 along, z2 hinge).
+fn frame_rotation(x1: Vec3, z1: Vec3, x2: Vec3, z2: Vec3) -> Quat {
+    let basis = |x: Vec3, z: Vec3| -> Option<glam::Mat3> {
+        let x = x.normalize_or_zero();
+        let z = (z - x * z.dot(x)).normalize_or_zero();
+        if x == Vec3::ZERO || z == Vec3::ZERO {
+            return None;
+        }
+        Some(glam::Mat3::from_cols(x, z.cross(x), z))
     };
-    for _ in 0..24 {
-        let mut done = false;
-        for &j in chain.iter().rev().skip(1) {
-            let w = rig.world(pose);
-            let joint: Vec3 = w[j].translation.into();
-            let end: Vec3 = w[effector].translation.into();
-            let to_end = (end - joint).normalize_or_zero();
-            let to_target = (target - joint).normalize_or_zero();
-            if to_end == Vec3::ZERO || to_target == Vec3::ZERO {
-                continue;
-            }
-            let delta = Quat::from_rotation_arc(to_end, to_target);
-            // limit each step for stability
-            let (axis, angle) = delta.to_axis_angle();
-            let delta = Quat::from_axis_angle(axis, angle.min(0.35));
-            // apply delta in world space to joint's local rotation
-            let parent_rot = {
-                let pi = rig.bones[j].parent;
-                if pi >= 0 { w[pi as usize].to_scale_rotation_translation().1 } else { Quat::IDENTITY }
-            };
-            let world_rot = parent_rot * pose[j].1;
-            let new_world = (delta * world_rot).normalize();
-            pose[j].1 = (parent_rot.inverse() * new_world).normalize();
-            let w2 = rig.world(pose);
-            let e: Vec3 = w2[effector].translation.into();
-            if (e - target).length() < 0.01 {
-                done = true;
-                break;
-            }
-        }
-        if done {
-            break;
-        }
+    match (basis(x1, z1), basis(x2, z2)) {
+        (Some(a), Some(b)) => Quat::from_mat3(&(b * a.transpose())).normalize(),
+        _ => Quat::from_rotation_arc(x1.normalize_or(Vec3::X), x2.normalize_or(Vec3::X)),
     }
-    // restore the effector's world orientation
+}
+
+/// Set bone `i`'s world rotation (its parent's world transform is `w[parent]`).
+fn set_world_rot(rig: &Rig, pose: &mut [(Vec3, Quat)], w: &[Affine3A], i: usize, world_rot: Quat) {
+    let pi = rig.bones[i].parent;
+    let parent_rot = if pi >= 0 { rot_of(&w[pi as usize]) } else { Quat::IDENTITY };
+    pose[i].1 = (parent_rot.inverse() * world_rot).normalize();
+}
+
+/// The limb's bend set-up, taken from the bind (reference) pose:
+/// * `pole` – the direction the elbow/knee points, in the frame of the limb root's parent
+///   (clavicle / pelvis), so it follows the body but not the limb;
+/// * `hinge_upper` / `hinge_lower` – the bend axis in the upper / lower bone's local frame.
+struct LimbSetup {
+    pole: Vec3,
+    hinge_upper: Vec3,
+    hinge_lower: Vec3,
+}
+
+fn limb_setup(rig: &Rig, ia: usize, ib: usize, ic: usize) -> LimbSetup {
+    let wb = rig.world(&rig.bind);
+    let (a, b, c) = (Vec3::from(wb[ia].translation), Vec3::from(wb[ib].translation), Vec3::from(wb[ic].translation));
+    let d = (c - a).normalize_or(Vec3::Z);
+    let off = (b - a) - d * (b - a).dot(d);
+    let len = (b - a).length() + (c - b).length();
+    let pole_world = if off.length() > len * 0.01 {
+        off.normalize()
+    } else {
+        // nearly straight in the reference pose: knees point where the toes do, elbows the
+        // other way
+        let forward = rig
+            .bones
+            .iter()
+            .enumerate()
+            .find(|(_, n)| has_any(&n.name, &["foot", "ankle"]) && !has_any(&n.name, &["toe"]))
+            .and_then(|(f, _)| rig.children(f).first().map(|&t| Vec3::from(wb[t].translation) - Vec3::from(wb[f].translation)))
+            .map(|v| v - d * v.dot(d))
+            .filter(|v| v.length() > 1e-4)
+            .map(|v| v.normalize());
+        let is_leg = has_any(&rig.bones[ic].name, &["foot", "ankle"]);
+        match forward {
+            Some(f) if is_leg => f,
+            Some(f) => -f,
+            None => any_perpendicular(d),
+        }
+    };
+    let hinge = d.cross(pole_world).normalize_or(any_perpendicular(d));
+    let pa = rig.bones[ia].parent;
+    let root_rot = if pa >= 0 { rot_of(&wb[pa as usize]) } else { Quat::IDENTITY };
+    LimbSetup {
+        pole: root_rot.inverse() * pole_world,
+        hinge_upper: rot_of(&wb[ia]).inverse() * hinge,
+        hinge_lower: rot_of(&wb[ib]).inverse() * hinge,
+    }
+}
+
+/// Easy-rig IK (like Source Filmmaker's): an analytic two-bone solve on the last three bones
+/// of `chain` (upper arm / forearm / hand, or thigh / calf / foot). The shoulder or hip stays
+/// put, the hand/foot goes exactly to `target` (clamped to the limb's reach) and keeps its
+/// world rotation, and the elbow/knee bends in the plane given by the reference pose, so it
+/// always points the natural way (elbows back, knees forward) with no twisting.
+pub fn solve_ik(rig: &Rig, pose: &mut [(Vec3, Quat)], chain: &[usize], target: Vec3) {
+    let n = chain.len();
+    if n < 3 {
+        return;
+    }
+    let (ia, ib, ic) = (chain[n - 3], chain[n - 2], chain[n - 1]);
+    let setup = limb_setup(rig, ia, ib, ic);
     let w = rig.world(pose);
-    let pi = rig.bones[effector].parent;
-    if pi >= 0 {
-        let parent_rot = w[pi as usize].to_scale_rotation_translation().1;
-        pose[effector].1 = (parent_rot.inverse() * eff_world_rot).normalize();
+    let eff_rot = rot_of(&w[ic]);
+    let (a, b, c) = (Vec3::from(w[ia].translation), Vec3::from(w[ib].translation), Vec3::from(w[ic].translation));
+    let (l1, l2) = ((b - a).length(), (c - b).length());
+    if l1 < 1e-4 || l2 < 1e-4 {
+        return;
     }
+    let to_t = target - a;
+    let dir = if to_t.length() > 1e-5 { to_t.normalize() } else { (c - a).normalize_or(Vec3::Z) };
+    let dist = to_t.length().clamp((l1 - l2).abs() + 1e-3, (l1 + l2) * 0.9999);
+    // where the elbow/knee points, following the body (clavicle / pelvis)
+    let pa = rig.bones[ia].parent;
+    let root_rot = if pa >= 0 { rot_of(&w[pa as usize]) } else { Quat::IDENTITY };
+    let pole = root_rot * setup.pole;
+    let mut p = pole - dir * pole.dot(dir);
+    if p.length() < 1e-4 {
+        // target straight along the pole: keep the current bend side
+        p = (b - a) - dir * (b - a).dot(dir);
+        if p.length() < 1e-4 {
+            p = any_perpendicular(dir);
+        }
+    }
+    let p = p.normalize();
+    let x = (l1 * l1 - l2 * l2 + dist * dist) / (2.0 * dist);
+    let y = (l1 * l1 - x * x).max(0.0).sqrt();
+    let elbow = a + dir * x + p * y;
+    let goal = a + dir * dist;
+    let hinge = dir.cross(p);
+    // upper bone: along a->elbow, hinge axis onto the bend plane's normal
+    let up_rot = rot_of(&w[ia]);
+    let r = frame_rotation(b - a, up_rot * setup.hinge_upper, elbow - a, hinge);
+    set_world_rot(rig, pose, &w, ia, (r * up_rot).normalize());
+    // lower bone: along elbow->goal, same hinge
+    let w = rig.world(pose);
+    let (b2, c2) = (Vec3::from(w[ib].translation), Vec3::from(w[ic].translation));
+    let lo_rot = rot_of(&w[ib]);
+    let r = frame_rotation(c2 - b2, lo_rot * setup.hinge_lower, goal - b2, hinge);
+    set_world_rot(rig, pose, &w, ib, (r * lo_rot).normalize());
+    // the hand/foot keeps its world orientation
+    let w = rig.world(pose);
+    set_world_rot(rig, pose, &w, ic, eff_rot);
 }
 
 // ---------------------------------------------------------------------------

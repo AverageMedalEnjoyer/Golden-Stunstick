@@ -1,4 +1,4 @@
-﻿// Hide the console window in release builds.
+// Hide the console window in release builds.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
@@ -8,6 +8,8 @@ pub use golden_stunstick::{anim, compile, decompile, formats, gamefs, render, sc
 
 /// The window / taskbar icon, embedded in the EXE.
 pub const ICON_PNG: &[u8] = include_bytes!("../assets/Stunstick_Icon.png");
+/// A white anti-aliased dot, tinted at draw time (list markers, pass/fail lights, swatches).
+pub const CIRCLE_PNG: &[u8] = include_bytes!("../assets/circle.png");
 
 fn window_icon() -> Option<eframe::egui::IconData> {
     let img = image::load_from_memory(ICON_PNG).ok()?.thumbnail(256, 256).to_rgba8();

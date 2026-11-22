@@ -24,12 +24,16 @@ decompiled with the Compiler & Decompiler tab, or your own source files.
 
 | Input | Action |
 |---|---|
-| Left drag | orbit |
+| Left drag on empty space | orbit |
 | Right drag / wheel | zoom |
 | Middle drag / Shift + left drag | pan |
 | Click near a joint | select that bone |
-| **Ctrl + left drag** on the selected bone | rotate it (horizontal = around the screen's up axis, vertical = around its right axis) |
-| **Ctrl + left drag** on an IK hand/foot | move the effector; the whole limb follows (easy rig) |
+| **Left drag starting on a joint** | select it and rotate it (horizontal = around the screen's up axis, vertical = around its right axis) |
+| **Left drag starting on an IK hand/foot** (green, easy rig on) | move the effector; the whole limb follows |
+| Ctrl + left drag anywhere | the same, for the already-selected bone (handy when joints overlap) |
+
+Joints are grabbed within 14 pixels of the cursor; dragging pauses playback. Bones are
+rotated, not stretched – only IK hands/feet "move", by bending their limb.
 
 The selected bone also has numeric **Position** / **Rotation °** fields in the left panel
 (local to its parent, rotation in Source's X/Y/Z Euler order), plus *Reset bone* and
@@ -42,10 +46,20 @@ The selected bone also has numeric **Position** / **Rotation °** fields in the 
 - arms: `hand`/`wrist` → forearm → upper arm → clavicle/collar/shoulder
 - legs: `foot`/`ankle` → calf/knee → thigh/hip
 
+Valve biped `Wrist` helper bones are skipped when a real `Hand` bone shares the forearm.
 Each chain can be toggled or removed, and *Add IK chain ending at '<bone>'* makes a custom chain
-from the selected bone and its two parents. Dragging an effector solves the chain with CCD IK
-(24 iterations, step-limited for stability) and keeps the hand/foot's own world rotation, so
-only the arm/leg bends.
+from the selected bone and its two parents.
+
+Dragging an effector works like Source Filmmaker's easy rig: an exact two-bone solve on the
+upper arm/forearm (thigh/calf), with the clavicle and pelvis left alone.
+
+- The hand/foot goes exactly where you drag it, in any direction (straight up included), and
+  keeps its own rotation. Past the limb's reach it stretches toward the cursor.
+- The elbow/knee always bends the natural way. Its direction comes from the model's reference
+  pose and is kept relative to the body: knees forward, elbows back. If the reference limb is
+  perfectly straight, knees follow the toes and elbows point the opposite way.
+- The upper and lower bones get a fixed, twist-free orientation, so dragging back and forth
+  never corkscrews the arm. Dragging back to a spot gives exactly the same pose.
 
 ## Keys, frames and transitions
 

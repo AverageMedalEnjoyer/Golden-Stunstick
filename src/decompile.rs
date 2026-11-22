@@ -1,4 +1,4 @@
-﻿//! MDL -> QC / SMD / VTA / VRD decompiler.
+//! MDL -> QC / SMD / VTA / VRD decompiler.
 //!
 //! Coordinate conventions (verified by compiling probe models with TF2's
 //! studiomdl and reading the result back):

@@ -1,4 +1,4 @@
-﻿//! Source engine studio model (.mdl v44-v49) parser, plus VVD/VTX geometry
+//! Source engine studio model (.mdl v44-v49) parser, plus VVD/VTX geometry
 //! and the RLE animation decoder.
 //!
 //! Struct layouts follow `public/studio.h` from the Source SDK 2013.

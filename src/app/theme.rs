@@ -1,4 +1,4 @@
-﻿//! Customizable theme (Settings -> Theme), persisted to goldenstunstick_files/settings.txt.
+//! Customizable theme (Settings -> Theme), persisted to goldenstunstick_files/settings.txt.
 
 use eframe::egui::{self, Color32, Stroke};
 use std::path::{Path, PathBuf};

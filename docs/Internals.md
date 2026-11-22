@@ -14,7 +14,7 @@ message, never a crash.
 | VTX (`.dx90.vtx`) | `formats/mdl.rs` | strip groups (SDK 2013 and newer layouts), triangle lists and strips; indices address the strip group's vertices (multi-strip meshes) |
 | PHY | `formats/phy.rs` | IVP compact surfaces/ledges, IVP→Source axes and units, trailing text section |
 | SMD / VTA | `formats/smd.rs` | read and write |
-| DMX | `formats/dmx.rs` | binary encodings 1�5 and KeyValues2 text; DmeModel ? skeleton + meshes for the Animator |
+| DMX | `formats/dmx.rs` | binary encodings 1–5 and KeyValues2 text; DmeModel → skeleton + meshes for the Animator |
 | QC | `formats/qc.rs` | tokenizer with line numbers, `$include`, lint |
 
 ## Coordinate systems

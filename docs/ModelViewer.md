@@ -45,10 +45,21 @@ background colour. **Screenshot** saves the viewport as PNG into the session's `
 folder.
 
 **Sequence** – searchable list (name and activity), play/pause, frame stepping, loop, speed
-(0–4×), frame slider, pose-parameter sliders (blend sequences are bilinearly blended across their
-blend grid), and the selected sequence's details: frame count, looping/delta, blend grid, events
-(frame, event name/number, options). By default a full-body idle (`stand_*`, `*idle*`) is chosen;
-delta (additive) layers are not auto-selected.
+(0–4×), frame slider, **pose parameters**, and the selected sequence's details: frame count,
+looping/delta, blend grid, events (frame, event name/number, options). By default a full-body
+idle (`stand_*`, `*idle*`) is chosen; delta (additive) layers are not auto-selected.
+
+Pose parameters (`move_x`, `move_y`, `body_yaw`, `body_pitch`, …) are collected from the model
+*and* its `$includemodel`s, matched by name as the engine does. Each one has a slider and a
+number box; *Reset* puts them all back to 0 (or mid-range). Names in bold are used by the current
+sequence or its layers. They drive:
+
+- the sequence's blend grid (e.g. `run_*` blends direction by `move_x`/`move_y`), blended
+  bilinearly;
+- the sequence's auto-layers (`addlayer` / `blendlayer`), evaluated like the engine:
+  start/peak/tail/end ramps, `spline`, `xfade`, `noblend`, pose-parameter-driven layers,
+  weight lists, and `delta` / `predelta` addition. HL2MP-style aim layers, for example, turn
+  the upper body with `body_yaw` and `body_pitch`.
 
 **Body / Skin / Paint** – every bodygroup with more than one choice, skin family, LOD, and the TF2
 paints (plus a custom colour). Paint applies to materials with the `ItemTintColor` proxy or
@@ -84,4 +95,4 @@ Meshes are skinned on the CPU (up to 3 bone weights per vertex, as in Source) an
 OpenGL inside the egui window: half-lambert lighting, alpha test, translucent and additive
 blending, `$nocull`, `$selfillum`, `$color2`. Not reproduced: phong, rim lighting, normal/detail
 maps, env maps, eye refraction and glints, shadows, physics simulation, facial phonemes and
-multi-layer gesture playback.
+manually stacked gesture layers (HLMV's extra sequence slots). Sequences' own auto-layers do play.

@@ -1,4 +1,4 @@
-﻿//! Valve KeyValues (text) parser, used for gameinfo.txt, VMT materials and
+//! Valve KeyValues (text) parser, used for gameinfo.txt, VMT materials and
 //! the embedded keyvalue blocks inside MDL files.
 //!
 //! The parser is forgiving: it accepts quoted and unquoted tokens, `//`

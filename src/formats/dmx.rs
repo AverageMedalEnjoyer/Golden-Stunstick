@@ -1,4 +1,4 @@
-﻿//! DMX (Valve DataModel) reader: binary encodings 1-5 and KeyValues2 text,
+//! DMX (Valve DataModel) reader: binary encodings 1-5 and KeyValues2 text,
 //! plus conversion of a DMX model (skeleton + meshes) into an `Smd`.
 
 use super::smd::{Smd, SmdNode, SmdTri, SmdVert};

@@ -2,10 +2,24 @@
 
 ## Compile
 
-Runs the session's `studiomdl.exe` with `-game <folder of gameinfo.txt> -nop4` on a QC (or on
-every QC in a folder, optionally including sub-folders). Output appears in the log as it happens;
-the finished model is written by studiomdl to `<game>\models\<$modelname>` (the log shows the
-path) and can additionally be copied to another folder.
+Runs the session's `studiomdl.exe` with `-game <folder> -nop4` on the input, which is a QC file or
+every QC in a folder (optionally including sub-folders); **Browse…** picks either. studiomdl's
+output appears in the log as it happens.
+
+**Output** – where the compiled `.mdl`, `.vvd`, `.vtx`, `.phy` and `.ani` files go:
+
+| Choice | Files end up in |
+|---|---|
+| Game's models folder (default) | `<game>\models\<$modelname>`, as studiomdl normally does |
+| Folder next to each QC | `<QC folder>\<sub-folder>` (default `compiled`) |
+| Custom folder | the folder you choose |
+
+studiomdl can only write into a game's `models` folder. For the last two choices it compiles
+into a private staging game in `%TEMP%`, which searches the session's game content, and the
+finished files are then moved to your folder, so the real game folder is not touched. The
+staging folder is deleted when the run ends. *Keep the $modelname sub-folders* recreates
+`player\john\…` under the output folder. **Open output folder** opens where the last model went.
+*Also copy output to* still makes an extra copy (with sub-folders) wherever the files went.
 
 Options: *Check QC before compiling*, `-verbose`, `-nox360`, `-fastbuild`, `-definebones`,
 `-printbones`, `-dumpmaterials`, and free-form extra arguments.

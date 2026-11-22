@@ -1,4 +1,4 @@
-﻿//! Tests against a real Team Fortress 2 install. Skipped automatically when
+//! Tests against a real Team Fortress 2 install. Skipped automatically when
 //! TF2 is not installed at the default Steam location (or GS_TF2_DIR).
 
 use golden_stunstick::formats::mdl::{Mdl, Vtx, Vvd};

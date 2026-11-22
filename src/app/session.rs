@@ -1,4 +1,4 @@
-﻿//! Sessions: a named folder with a `session_settings.txt` pointing at the
+//! Sessions: a named folder with a `session_settings.txt` pointing at the
 //! game's gameinfo.txt and (optionally) studiomdl.exe.
 
 use std::path::{Path, PathBuf};

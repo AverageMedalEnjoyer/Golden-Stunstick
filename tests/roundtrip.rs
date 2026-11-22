@@ -1,4 +1,4 @@
-﻿//! Decompile -> studiomdl -> compare round trip against real TF2 models.
+//! Decompile -> studiomdl -> compare round trip against real TF2 models.
 //! Skipped when TF2 (and its studiomdl) is not installed.
 
 use golden_stunstick::compile::{self, CompileJob, CompileMsg};

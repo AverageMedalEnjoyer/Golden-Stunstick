@@ -1,4 +1,4 @@
-﻿//! Probe studiomdl's coordinate handling with a synthetic model.
+//! Probe studiomdl's coordinate handling with a synthetic model.
 use golden_stunstick::compile::{self, CompileJob, CompileMsg};
 use golden_stunstick::formats::mdl::{Mdl, quat_to_euler};
 use golden_stunstick::formats::phy::Phy;

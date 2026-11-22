@@ -1,4 +1,4 @@
-﻿//! Main window: Files / Settings menus, sessions and the three tabs.
+//! Main window: Files / Settings menus, sessions and the three tabs.
 
 pub mod files;
 pub mod session;
@@ -31,9 +31,16 @@ pub struct Shared {
     pub renderer: SharedRenderer,
     pub theme: Theme,
     pub notices: Vec<(String, bool)>,
+    /// `assets/circle.png`, uploaded once
+    pub circle: Option<egui::TextureHandle>,
 }
 
 impl Shared {
+    /// A `size`-pixel dot in `color` (from the embedded circle asset).
+    pub fn dot(&self, color: Color32, size: f32) -> egui::Image<'static> {
+        let id = self.circle.as_ref().map(|t| t.id()).unwrap_or_default();
+        egui::Image::from_texture(egui::load::SizedTexture::new(id, egui::vec2(size, size))).tint(color)
+    }
     pub fn notify(&mut self, msg: impl Into<String>) {
         self.notices.push((msg.into(), false));
     }
@@ -80,9 +87,14 @@ impl GoldenStunstick {
             let ci = egui::ColorImage::from_rgba_unmultiplied([img.width() as usize, img.height() as usize], img.as_raw());
             cc.egui_ctx.load_texture("gs_icon", ci, egui::TextureOptions::LINEAR)
         });
+        let circle = image::load_from_memory(crate::CIRCLE_PNG).ok().map(|img| {
+            let img = img.to_rgba8();
+            let ci = egui::ColorImage::from_rgba_unmultiplied([img.width() as usize, img.height() as usize], img.as_raw());
+            cc.egui_ctx.load_texture("gs_circle", ci, egui::TextureOptions::LINEAR)
+        });
         let renderer: SharedRenderer = Arc::new(Mutex::new(None));
         GoldenStunstick {
-            shared: Shared { files, session: None, fs: None, fs_status: String::new(), renderer, theme, notices: Vec::new() },
+            shared: Shared { files, session: None, fs: None, fs_status: String::new(), renderer, theme, notices: Vec::new(), circle },
             tab: Tab::ModelViewer,
             icon,
             new_session: None,
@@ -127,6 +139,12 @@ impl GoldenStunstick {
         }
         self.pending_model = get("--model");
         self.pending_seq = get("--seq");
+        if let Some(p) = get("--viewer-page") {
+            self.viewer.set_panel(&p);
+        }
+        if args.iter().any(|a| a == "--open-session-list") {
+            self.open_session = Some(self.shared.files.list_sessions());
+        }
     }
 
     fn start_session(&mut self, s: Session) {
@@ -313,7 +331,8 @@ impl GoldenStunstick {
                 }
                 egui::ScrollArea::vertical().max_height(280.0).show(ui, |ui| {
                     for name in list {
-                        if ui.add(egui::Button::new(RichText::new(format!("ðŸ“  {name}"))).min_size(egui::vec2(ui.available_width(), 24.0))).clicked() {
+                        let dot = self.shared.dot(self.shared.theme.accent, 9.0);
+                        if ui.add(egui::Button::image_and_text(dot, format!(" {name}")).min_size(egui::vec2(ui.available_width(), 24.0))).clicked() {
                             chosen = Some(name.clone());
                         }
                     }

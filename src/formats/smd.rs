@@ -1,4 +1,4 @@
-﻿//! StudioMDL Data (.smd) reader and writer, plus VTA (vertex animation) writer.
+//! StudioMDL Data (.smd) reader and writer, plus VTA (vertex animation) writer.
 
 use glam::Vec3;
 use std::fmt::Write as _;

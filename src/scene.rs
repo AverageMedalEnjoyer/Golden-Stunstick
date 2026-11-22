@@ -1,4 +1,4 @@
-﻿//! A loaded studio model ready to be posed and drawn: MDL + VVD + VTX + PHY,
+//! A loaded studio model ready to be posed and drawn: MDL + VVD + VTX + PHY,
 //! `$includemodel` animation sources, VMT/VTF materials from the mounted game.
 
 use crate::formats::keyvalues::{self, Kv};
@@ -66,6 +66,8 @@ pub struct ModelScene {
     pub skin_base: Vec<Affine3A>,
     pub warnings: Vec<String>,
     pub mdl_source: String,
+    /// pose parameters of the model and its `$includemodel`s, merged by name
+    pub pose_params: Vec<PoseParam>,
 }
 
 fn affine_from_3x4(m: &[[f32; 4]; 3]) -> Affine3A {
@@ -144,6 +146,7 @@ impl ModelScene {
             skin_base: Vec::new(),
             warnings,
             mdl_source,
+            pose_params: Vec::new(),
         };
         scene.bind_world = crate::decompile::bind_world(&mdl);
         scene.skin_base = mdl.bones.iter().map(|b| affine_from_3x4(&b.pose_to_bone)).collect();
@@ -194,8 +197,57 @@ impl ModelScene {
                 });
             }
         }
+        // pose parameters of the model and its includes, merged by name (as the engine's
+        // virtual model does); the first definition wins
+        for src in &scene.sources {
+            for p in &src.mdl.pose_params {
+                if !scene.pose_params.iter().any(|q| q.name.eq_ignore_ascii_case(&p.name)) {
+                    scene.pose_params.push(p.clone());
+                }
+            }
+        }
         scene.load_materials(fs);
         Ok(scene)
+    }
+
+    /// Scene-wide pose parameter indices that sequence `seq` (or its layers) responds to.
+    pub fn sequence_pose_params(&self, seq: usize) -> Vec<usize> {
+        let mut out = Vec::new();
+        let Some(sr) = self.seqs.get(seq) else { return out };
+        let mut stack = vec![(sr.source, sr.index, 0u32)];
+        while let Some((si, qi, depth)) = stack.pop() {
+            let src = &self.sources[si];
+            let Some(sd) = src.mdl.seqs.get(qi) else { continue };
+            let mut add = |local: i32| {
+                let Some(name) = usize::try_from(local).ok().and_then(|l| src.mdl.pose_params.get(l)).map(|p| &p.name) else { return };
+                if let Some(i) = self.pose_params.iter().position(|p| p.name.eq_ignore_ascii_case(name)) {
+                    if !out.contains(&i) {
+                        out.push(i);
+                    }
+                }
+            };
+            for k in 0..2 {
+                if sd.groupsize[k] > 1 {
+                    add(sd.paramindex[k]);
+                }
+            }
+            for l in &sd.autolayers {
+                if l.flags & 0x4000 != 0 && l.start != l.end {
+                    add(l.pose as i32);
+                }
+                if l.sequence >= 0 && depth < 4 {
+                    stack.push((si, l.sequence as usize, depth + 1));
+                }
+            }
+        }
+        out
+    }
+
+    /// Value of source `si`'s pose parameter `local` from the scene-wide list `values`.
+    fn pose_value(&self, si: usize, local: i32, values: &[f32]) -> Option<f32> {
+        let name = &self.sources[si].mdl.pose_params.get(usize::try_from(local).ok()?)?.name;
+        let i = self.pose_params.iter().position(|p| p.name.eq_ignore_ascii_case(name))?;
+        values.get(i).copied()
     }
 
     fn load_materials(&mut self, fs: Option<&GameFs>) {
@@ -266,13 +318,96 @@ impl ModelScene {
         self.bones().iter().map(|b| (b.pos, b.quat)).collect()
     }
 
-    /// Local pose for a sequence at `frame` (fractional), blending by pose parameters.
-    /// `pose_params` are indexed by the main model's pose parameter list.
+    /// Local pose for a sequence at `frame` (fractional): its pose-parameter blend plus its
+    /// auto-layers (`addlayer` / `blendlayer`, e.g. HL2MP's body_yaw/body_pitch aim layers),
+    /// following the engine's `AccumulatePose` / `AddSequenceLayers`.
+    /// `pose_params` are indexed like [`ModelScene::pose_params`].
     pub fn sequence_pose(&self, seq: usize, frame: f32, pose_params: &[f32]) -> Vec<(Vec3, Quat)> {
         let mut out = self.bind_pose();
         let Some(sr) = self.seqs.get(seq) else { return out };
-        let src = &self.sources[sr.source];
-        let sd = &src.mdl.seqs[sr.index];
+        let cycle = if sr.frames > 1 { frame / (sr.frames - 1) as f32 } else { 0.0 };
+        // (a delta sequence on its own is shown on top of the bind pose)
+        self.accumulate(&mut out, sr.source, sr.index, cycle, 1.0, pose_params, 0);
+        out
+    }
+
+    fn accumulate(&self, out: &mut [(Vec3, Quat)], si: usize, qi: usize, cycle: f32, weight: f32, pose_params: &[f32], depth: u32) {
+        let src = &self.sources[si];
+        let Some(sd) = src.mdl.seqs.get(qi) else { return };
+        if weight > 1e-4 {
+            if let Some(vals) = self.raw_sequence_values(si, qi, cycle, pose_params) {
+                let delta = sd.flags & STUDIO_DELTA != 0 || sd.anim_indices.first().and_then(|&a| src.mdl.anims.get(a.max(0) as usize)).map(|a| a.flags & STUDIO_DELTA != 0).unwrap_or(false);
+                let post = sd.flags & STUDIO_POST != 0;
+                for (i, v) in vals.into_iter().enumerate() {
+                    let Some((p, q)) = v else { continue };
+                    let Some(Some(mi)) = src.to_main.get(i) else { continue };
+                    let bw = weight * sd.weightlist.get(i).copied().unwrap_or(1.0);
+                    if bw <= 0.0 {
+                        continue;
+                    }
+                    let o = &mut out[*mi];
+                    if delta {
+                        let dq = Quat::IDENTITY.slerp(q, bw.min(1.0));
+                        o.1 = if post { o.1 * dq } else { dq * o.1 }.normalize();
+                        o.0 += p * bw;
+                    } else if bw >= 1.0 {
+                        *o = (p, q);
+                    } else {
+                        let q = if o.1.dot(q) < 0.0 { -q } else { q };
+                        *o = (o.0.lerp(p, bw), o.1.slerp(q, bw).normalize());
+                    }
+                }
+            }
+        }
+        if depth >= 4 {
+            return;
+        }
+        // auto-layers (studio.h STUDIO_AL_*)
+        const AL_SPLINE: i32 = 0x40;
+        const AL_XFADE: i32 = 0x80;
+        const AL_NOBLEND: i32 = 0x200;
+        const AL_POSE: i32 = 0x4000;
+        for l in &sd.autolayers {
+            let mut layer_cycle = cycle;
+            let mut layer_weight = weight;
+            if l.start != l.end {
+                let index = if l.flags & AL_POSE != 0 { self.pose_value(si, l.pose as i32, pose_params).unwrap_or(0.0) } else { cycle };
+                if index < l.start || index >= l.end {
+                    continue;
+                }
+                let mut s = 1.0;
+                if index < l.peak && l.start != l.peak {
+                    s = (index - l.start) / (l.peak - l.start);
+                } else if index > l.tail && l.end != l.tail {
+                    s = (l.end - index) / (l.end - l.tail);
+                }
+                if l.flags & AL_SPLINE != 0 {
+                    s = s * s * (3.0 - 2.0 * s);
+                }
+                layer_weight = if l.flags & AL_XFADE != 0 && index > l.tail {
+                    (s * weight) / (1.0 - weight + s * weight).max(1e-6)
+                } else if l.flags & AL_NOBLEND != 0 {
+                    s
+                } else {
+                    weight * s
+                };
+                if l.flags & AL_POSE == 0 {
+                    layer_cycle = (cycle - l.start) / (l.end - l.start);
+                }
+            }
+            if l.sequence >= 0 {
+                self.accumulate(out, si, l.sequence as usize, layer_cycle, layer_weight, pose_params, depth + 1);
+            }
+        }
+    }
+
+    /// The blended local values of source `si`'s sequence `qi` at `cycle` (0..1), per bone of
+    /// that source (`None` for bones the sequence does not animate). Delta sequences give
+    /// their raw deltas.
+    fn raw_sequence_values(&self, si: usize, qi: usize, cycle: f32, pose_params: &[f32]) -> Option<Vec<Option<(Vec3, Quat)>>> {
+        let src = &self.sources[si];
+        let sd = src.mdl.seqs.get(qi)?;
+        let looping = sd.flags & STUDIO_LOOPING != 0;
         let gx = sd.groupsize[0].max(1) as usize;
         let gy = sd.groupsize[1].max(1) as usize;
         // blend weights
@@ -280,10 +415,7 @@ impl ModelScene {
             if n <= 1 {
                 return (0, 0, 0.0);
             }
-            let pi = sd.paramindex[k];
-            let name = src.mdl.pose_params.get(pi.max(0) as usize).map(|p| p.name.clone()).unwrap_or_default();
-            let main_idx = self.main().pose_params.iter().position(|p| p.name.eq_ignore_ascii_case(&name));
-            let v = main_idx.and_then(|i| pose_params.get(i).copied()).unwrap_or((sd.paramstart[k] + sd.paramend[k]) * 0.5);
+            let v = self.pose_value(si, sd.paramindex[k], pose_params).unwrap_or((sd.paramstart[k] + sd.paramend[k]) * 0.5);
             let span = sd.paramend[k] - sd.paramstart[k];
             let s = if span.abs() > 1e-6 { ((v - sd.paramstart[k]) / span).clamp(0.0, 1.0) } else { 0.0 } * (n - 1) as f32;
             let i0 = (s.floor() as usize).min(n - 1);
@@ -304,20 +436,17 @@ impl ModelScene {
             }
         }
         if blend.is_empty() {
-            return out;
+            return None;
         }
-        let first_frames = src.mdl.anims.get(blend[0].0).map(|a| a.numframes).unwrap_or(1).max(1);
-        let cycle = if first_frames > 1 { frame / (first_frames - 1) as f32 } else { 0.0 };
         let nb = src.mdl.bones.len();
         let mut acc: Vec<(Vec3, Quat, f32)> = vec![(Vec3::ZERO, Quat::IDENTITY, 0.0); nb];
-        let mut is_delta = false;
         for (ai, w) in blend {
             let Some(ad) = src.mdl.anims.get(ai) else { continue };
-            is_delta |= ad.flags & STUDIO_DELTA != 0;
             let n = ad.numframes.max(1);
-            let f = (cycle * (n - 1) as f32).clamp(0.0, (n - 1) as f32);
+            let c = if looping { cycle.rem_euclid(1.0) } else { cycle.clamp(0.0, 1.0) };
+            let f = (c * (n - 1) as f32).clamp(0.0, (n - 1) as f32);
             let f0 = f.floor() as i32;
-            let f1 = if sr.looping && f0 + 1 >= n { 0 } else { (f0 + 1).min(n - 1) };
+            let f1 = if looping && f0 + 1 >= n { 0 } else { (f0 + 1).min(n - 1) };
             let t = f - f0 as f32;
             let a = src.mdl.decode_frame(ai, f0, src.ani.as_deref());
             let b = if t > 1e-4 { src.mdl.decode_frame(ai, f1, src.ani.as_deref()) } else { a.clone() };
@@ -331,16 +460,7 @@ impl ModelScene {
                 e.2 += w;
             }
         }
-        for (i, (p, q, w)) in acc.into_iter().enumerate() {
-            if w <= 0.0 {
-                continue;
-            }
-            let p = p / w;
-            let Some(Some(mi)) = src.to_main.get(i) else { continue };
-            let bind = &self.bones()[*mi];
-            out[*mi] = if is_delta { (bind.pos + p, (bind.quat * q).normalize()) } else { (p, q.normalize()) };
-        }
-        out
+        Some(acc.into_iter().map(|(p, q, w)| (w > 0.0).then(|| (p / w, q.normalize()))).collect())
     }
 
     /// World transforms for a local pose.

@@ -1,4 +1,4 @@
-﻿//! studiomdl runner and compile-output analysis.
+//! studiomdl runner and compile-output analysis.
 
 use crate::formats::qc::{Issue, Severity};
 use std::io::{BufRead, BufReader};

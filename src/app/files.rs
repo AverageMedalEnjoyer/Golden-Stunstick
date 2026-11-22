@@ -1,4 +1,4 @@
-﻿//! The `goldenstunstick_files` folder next to the EXE.
+//! The `goldenstunstick_files` folder next to the EXE.
 //!
 //! The folder is created once at startup and re-created (cheaply) whenever it
 //! is found missing. `ensure()` only touches the disk when something is

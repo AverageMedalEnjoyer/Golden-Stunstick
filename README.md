@@ -7,7 +7,7 @@ A Source engine modding workbench in a single Windows EXE:
 - **Animator** – frame-by-frame / pose-by-pose animation of any QC's skeleton, with an
   automatic "easy rig" (IK for arms and legs), keyframe easing, smoothing and crossfades,
   saved to your session and exported as **SMD** or **DMX** (both verified to compile with studiomdl).
-- **Model Viewer** – an HLMV++-style viewer for every model in the game your session mounts,
+- **Model Viewer** – an HLMV-style viewer for every model in the game your session mounts,
   with filters by name / folder / VPK, sequences and blends, bodygroups, skins, LODs, TF2 paints,
   flexes, bones, attachments, hitboxes, physics, bonemerge and a material/VPK report.
 - **Compiler & Decompiler** – a Crowbar-style front end for `studiomdl.exe` with QC pre-checks,
@@ -105,6 +105,8 @@ New Session fills it in automatically when it can find it.
 | `--model <models/...mdl>` | open a model from the mounted game in the Model Viewer |
 | `--seq <name>` | sequence to play for `--model` |
 | `--qc <file.qc>` | open a QC in the Animator (`--easy-rig` also builds the IK rig) |
+| `--viewer-page <name>` | Model Viewer panel: `render`, `sequence`, `body`, `flexes`, `bones`, `attachments`, `hitboxes`, `physics`, `bonemerge`, `materials`, `info` |
+| `--open-session-list` | show the Open Session list on start |
 
 ---
 

@@ -1,4 +1,4 @@
-﻿//! Golden Stunstick core library. The GUI binary lives in `main.rs`; all
+//! Golden Stunstick core library. The GUI binary lives in `main.rs`; all
 //! file-format and tool logic lives here so it can be tested headlessly.
 
 pub mod anim;

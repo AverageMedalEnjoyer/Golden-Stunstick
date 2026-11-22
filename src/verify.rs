@@ -1,4 +1,4 @@
-﻿//! Decompile accuracy verification.
+//! Decompile accuracy verification.
 //!
 //! Two levels:
 //! 1. `self_check` re-reads every SMD the decompiler wrote and compares it

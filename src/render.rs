@@ -1,4 +1,4 @@
-﻿//! OpenGL model renderer drawn inside egui through a glow paint callback.
+//! OpenGL model renderer drawn inside egui through a glow paint callback.
 
 use eframe::egui;
 use eframe::egui_glow;

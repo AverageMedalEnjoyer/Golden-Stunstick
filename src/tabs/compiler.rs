@@ -1,4 +1,4 @@
-﻿//! Compiler & Decompiler tab (a Crowbar-style front end for studiomdl plus
+//! Compiler & Decompiler tab (a Crowbar-style front end for studiomdl plus
 //! Golden Stunstick's own verified decompiler).
 
 use crate::app::Shared;
@@ -15,6 +15,18 @@ enum Page {
     #[default]
     Compile,
     Decompile,
+}
+
+/// Where compiled models go.
+#[derive(PartialEq, Eq, Clone, Copy, Default)]
+enum OutMode {
+    /// `<game>/models/<$modelname>` (studiomdl's own behaviour)
+    #[default]
+    GameModels,
+    /// `<qc folder>/<subfolder>`
+    NextToQc,
+    /// a folder of your choice
+    Custom,
 }
 
 #[derive(PartialEq, Eq, Clone, Copy, Default)]
@@ -46,6 +58,11 @@ pub struct CompilerTab {
     lint_first: bool,
     extra_args: String,
     copy_to: String,
+    out_mode: OutMode,
+    out_custom: String,
+    out_sub: String,
+    out_keep_tree: bool,
+    last_out_dir: Option<PathBuf>,
     log: Vec<String>,
     issues: Vec<Issue>,
     show_fixes: bool,
@@ -86,6 +103,11 @@ impl Default for CompilerTab {
             lint_first: true,
             extra_args: String::new(),
             copy_to: String::new(),
+            out_mode: OutMode::GameModels,
+            out_custom: String::new(),
+            out_sub: "compiled".into(),
+            out_keep_tree: false,
+            last_out_dir: None,
             log: Vec::new(),
             issues: Vec::new(),
             show_fixes: false,
@@ -109,6 +131,12 @@ impl Default for CompilerTab {
             model_list: None,
         }
     }
+}
+
+/// Private game folder studiomdl compiles into when the output is not the game's own
+/// models folder (removed when the compile run ends).
+fn staging_game_dir() -> PathBuf {
+    std::env::temp_dir().join(format!("golden_stunstick_compile_{}", std::process::id()))
 }
 
 pub fn open_folder(p: &Path) {
@@ -255,9 +283,18 @@ impl CompilerTab {
         let s = sh.session.as_ref();
         CompileJob {
             studiomdl: s.and_then(|s| s.studiomdl.clone()).unwrap_or_default(),
-            game_dir: s.map(|s| s.game_dir()).unwrap_or_default(),
+            game_dir: if self.out_mode == OutMode::GameModels { s.map(|s| s.game_dir()).unwrap_or_default() } else { staging_game_dir() },
             qc: qc.to_path_buf(),
             extra_args: extra,
+        }
+    }
+
+    /// The folder a QC's compiled files end up in (None for the game's models folder).
+    fn output_root(&self, qc: &Path) -> Option<PathBuf> {
+        match self.out_mode {
+            OutMode::GameModels => None,
+            OutMode::NextToQc => Some(qc.parent().unwrap_or(Path::new(".")).join(self.out_sub.trim())),
+            OutMode::Custom => Some(PathBuf::from(self.out_custom.trim().trim_matches('"'))),
         }
     }
 
@@ -267,22 +304,51 @@ impl CompilerTab {
         let Some(s) = &sh.session else { return };
         let rel = name.replace('\\', "/");
         let rel = rel.strip_prefix("models/").unwrap_or(&rel).to_string();
-        let out = s.game_dir().join("models").join(&rel);
-        self.log.push(format!("Output: {}", out.display()));
+        let rel_dir = Path::new(&rel).parent().unwrap_or(Path::new("")).to_path_buf();
+        const EXTS: [&str; 8] = [".mdl", ".vvd", ".dx90.vtx", ".dx80.vtx", ".sw.vtx", ".phy", ".ani", ".vtx"];
+        let files_of = |stem: &Path| -> Vec<PathBuf> { EXTS.iter().map(|e| PathBuf::from(format!("{}{e}", stem.display()))).filter(|p| p.is_file()).collect() };
+        let stem = match self.output_root(qc_path) {
+            None => {
+                let out = s.game_dir().join("models").join(&rel);
+                self.log.push(format!("Output: {}", out.display()));
+                self.last_out_dir = out.parent().map(|p| p.to_path_buf());
+                out.with_extension("")
+            }
+            Some(root) => {
+                // studiomdl wrote into the staging game; move the files to the chosen folder
+                let staged = staging_game_dir().join("models").join(&rel).with_extension("");
+                let dest = if self.out_keep_tree { root.join(&rel_dir) } else { root };
+                if let Err(e) = std::fs::create_dir_all(&dest) {
+                    self.log.push(format!("ERROR: could not create {}: {e}", dest.display()));
+                    return;
+                }
+                let staged_files = files_of(&staged);
+                if staged_files.is_empty() {
+                    self.log.push(format!("ERROR: studiomdl reported success but no files were found in {}", staged.parent().unwrap_or(Path::new("")).display()));
+                    return;
+                }
+                for src in staged_files {
+                    let d = dest.join(src.file_name().unwrap_or_default());
+                    let r = std::fs::rename(&src, &d).or_else(|_| std::fs::copy(&src, &d).and_then(|_| std::fs::remove_file(&src)));
+                    match r {
+                        Ok(_) => self.log.push(format!("Output: {}", d.display())),
+                        Err(e) => self.log.push(format!("ERROR writing {}: {e}", d.display())),
+                    }
+                }
+                self.last_out_dir = Some(dest.clone());
+                dest.join(Path::new(&rel).file_stem().unwrap_or_default())
+            }
+        };
         if self.copy_to.trim().is_empty() {
             return;
         }
-        let dest = PathBuf::from(self.copy_to.trim()).join(Path::new(&rel).parent().unwrap_or(Path::new("")));
+        let dest = PathBuf::from(self.copy_to.trim()).join(&rel_dir);
         let _ = std::fs::create_dir_all(&dest);
-        let stem = out.with_extension("");
-        for ext in [".mdl", ".vvd", ".dx90.vtx", ".dx80.vtx", ".sw.vtx", ".phy", ".ani", ".vtx"] {
-            let src = PathBuf::from(format!("{}{ext}", stem.display()));
-            if src.is_file() {
-                let d = dest.join(src.file_name().unwrap_or_default());
-                match std::fs::copy(&src, &d) {
-                    Ok(_) => self.log.push(format!("Copied {}", d.display())),
-                    Err(e) => self.log.push(format!("ERROR copying {}: {e}", src.display())),
-                }
+        for src in files_of(&stem) {
+            let d = dest.join(src.file_name().unwrap_or_default());
+            match std::fs::copy(&src, &d) {
+                Ok(_) => self.log.push(format!("Copied {}", d.display())),
+                Err(e) => self.log.push(format!("ERROR copying {}: {e}", src.display())),
             }
         }
     }
@@ -315,6 +381,28 @@ impl CompilerTab {
                 return;
             }
         }
+        match self.out_mode {
+            OutMode::GameModels => {}
+            OutMode::Custom if self.out_custom.trim().is_empty() => {
+                sh.error("Choose an output folder (or pick another output option)");
+                return;
+            }
+            OutMode::NextToQc if self.out_sub.trim().is_empty() || self.out_sub.contains(['/', '\\', ':']) => {
+                sh.error("Type a sub-folder name for 'Folder next to each QC' (a plain name, e.g. compiled)");
+                return;
+            }
+            _ => {
+                // studiomdl always writes to <game>/models, so compile into a private staging
+                // game (searching the session's game content) and move the files afterwards
+                let dir = staging_game_dir();
+                let _ = std::fs::remove_dir_all(&dir);
+                if let Err(e) = compile::make_temp_game(&dir, sh.fs.as_deref()) {
+                    sh.error(format!("Could not create the staging folder {}: {e}", dir.display()));
+                    return;
+                }
+            }
+        }
+        self.last_out_dir = None;
         self.queue = qcs;
         self.queue.reverse();
         self.start_next(sh);
@@ -323,6 +411,9 @@ impl CompilerTab {
     fn start_next(&mut self, sh: &mut Shared) {
         let Some(qc) = self.queue.pop() else {
             self.current_qc = None;
+            if self.out_mode != OutMode::GameModels {
+                let _ = std::fs::remove_dir_all(staging_game_dir());
+            }
             return;
         };
         self.current_lines.clear();
@@ -380,6 +471,43 @@ impl CompilerTab {
             ui.label("Game folder");
             ui.label(sh.session.as_ref().map(|s| s.game_dir().display().to_string()).unwrap_or_default());
             ui.end_row();
+            ui.label("Output");
+            ui.add_enabled_ui(!busy, |ui| {
+                ui.vertical(|ui| {
+                    ui.horizontal(|ui| {
+                        ui.radio_value(&mut self.out_mode, OutMode::GameModels, "Game's models folder");
+                        ui.radio_value(&mut self.out_mode, OutMode::NextToQc, "Folder next to each QC");
+                        ui.radio_value(&mut self.out_mode, OutMode::Custom, "Custom folder");
+                    });
+                    match self.out_mode {
+                        OutMode::GameModels => {
+                            let g = sh.session.as_ref().map(|s| s.game_dir().join("models").display().to_string()).unwrap_or_default();
+                            ui.label(RichText::new(format!("{g}\\<$modelname>")).small().weak());
+                        }
+                        OutMode::NextToQc => {
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new("<QC folder>\\").weak());
+                                ui.add(egui::TextEdit::singleline(&mut self.out_sub).desired_width(160.0));
+                            });
+                        }
+                        OutMode::Custom => {
+                            ui.horizontal(|ui| {
+                                ui.add(egui::TextEdit::singleline(&mut self.out_custom).hint_text("output folder").desired_width(520.0));
+                                if ui.button("Browse...").clicked() {
+                                    if let Some(p) = rfd::FileDialog::new().pick_folder() {
+                                        self.out_custom = p.display().to_string();
+                                    }
+                                }
+                            });
+                        }
+                    }
+                    if self.out_mode != OutMode::GameModels {
+                        ui.checkbox(&mut self.out_keep_tree, "Keep the $modelname sub-folders (e.g. player\\john\\)")
+                            .on_hover_text("studiomdl compiles into a private staging folder; the finished files are moved here, so the game's models folder is not touched");
+                    }
+                });
+            });
+            ui.end_row();
             ui.label("studiomdl.exe");
             ui.label(sh.session.as_ref().and_then(|s| s.studiomdl.as_ref()).map(|p| p.display().to_string()).unwrap_or_else(|| "(not set in this session)".into()));
             ui.end_row();
@@ -430,6 +558,11 @@ impl CompilerTab {
             if let Some(p) = &self.last_error_log {
                 if ui.link(format!("Open {}", p.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default())).clicked() {
                     let _ = std::process::Command::new("notepad").arg(p).spawn();
+                }
+            }
+            if let Some(d) = self.last_out_dir.clone() {
+                if ui.button("Open output folder").on_hover_text(d.display().to_string()).clicked() {
+                    open_folder(&d);
                 }
             }
             if let Some(s) = &sh.session {
@@ -666,13 +799,14 @@ impl CompilerTab {
                     }
                     for (name, checks) in &self.d_checks {
                         let all_ok = checks.iter().all(|c| c.ok);
-                        egui::CollapsingHeader::new(RichText::new(format!("{} {name}", if all_ok { "âœ”" } else { "âœ˜" })).color(if all_ok { Color32::from_rgb(130, 220, 130) } else { Color32::from_rgb(255, 120, 120) }))
+                        let (good, bad) = (Color32::from_rgb(130, 220, 130), Color32::from_rgb(255, 120, 120));
+                        egui::CollapsingHeader::new(RichText::new(format!("{name} \u{2013} {}", if all_ok { "all checks pass" } else { "differences found" })).color(if all_ok { good } else { bad }))
                             .default_open(true)
                             .id_salt(name)
                             .show(ui, |ui| {
                                 for c in checks {
                                     ui.horizontal_wrapped(|ui| {
-                                        ui.colored_label(if c.ok { Color32::from_rgb(130, 220, 130) } else { Color32::from_rgb(255, 120, 120) }, if c.ok { "âœ”" } else { "âœ˜" });
+                                        ui.add(sh.dot(if c.ok { good } else { bad }, 10.0)).on_hover_text(if c.ok { "matches" } else { "differs" });
                                         ui.label(RichText::new(&c.category).strong());
                                         ui.label(&c.detail);
                                     });

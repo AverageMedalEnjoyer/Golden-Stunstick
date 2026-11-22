@@ -1,4 +1,4 @@
-﻿//! Animator tab: frame-by-frame / pose-by-pose animation of a QC's skeleton.
+//! Animator tab: frame-by-frame / pose-by-pose animation of a QC's skeleton.
 
 use crate::anim::{self, AnimDoc, Ease, IkChain, Keyframe, Rig};
 use crate::app::Shared;
@@ -77,6 +77,8 @@ pub struct AnimatorTab {
     undo: Vec<std::collections::BTreeMap<u32, Keyframe>>,
     redo: Vec<std::collections::BTreeMap<u32, Keyframe>>,
     in_gesture: bool,
+    /// a left drag that started on a joint: it moves that bone instead of orbiting
+    bone_drag: bool,
     fade_from: u32,
     fade_to: u32,
     fade_ease: Ease,
@@ -113,6 +115,7 @@ impl Default for AnimatorTab {
             undo: Vec::new(),
             redo: Vec::new(),
             in_gesture: false,
+            bone_drag: false,
             fade_from: 0,
             fade_to: 10,
             fade_ease: Ease::Smooth,
@@ -562,7 +565,7 @@ impl AnimatorTab {
                 }
             }
         }
-        ui.label(RichText::new("Ctrl+drag a hand/foot to move the limb. Ctrl+drag any other bone to rotate it. Click a joint to select it.").small().weak());
+        ui.label(RichText::new("Drag a joint to pose it: an IK hand/foot (green) moves the whole limb, any other bone rotates. Drag empty space to orbit. Ctrl+drag works on the selected bone from anywhere.").small().weak());
         ui.separator();
 
         // ---- selected bone transform
@@ -783,7 +786,29 @@ impl AnimatorTab {
         let rect = ui.available_rect_before_wrap();
         let resp = ui.allocate_rect(rect, egui::Sense::click_and_drag());
         let ctrl = ui.input(|i| i.modifiers.ctrl);
-        let manip = ctrl && self.sel_bone.is_some() && resp.dragged_by(egui::PointerButton::Primary);
+        // A left drag that starts on a joint grabs that bone; anywhere else it orbits.
+        // (Ctrl + left drag manipulates the selected bone from anywhere.)
+        if resp.drag_started_by(egui::PointerButton::Primary) {
+            self.bone_drag = false;
+            let shift = ui.input(|i| i.modifiers.shift);
+            if !ctrl && !shift && self.show_bones {
+                let origin = ui.input(|i| i.pointer.press_origin());
+                if let (Some(pos), Some(rig), Some(doc)) = (origin, &self.rig, &self.doc) {
+                    let pose = doc.sample(if self.playing { self.frame } else { self.frame.round() }, &rig.bind);
+                    let world = rig.world(&pose);
+                    let vp = self.camera.view_proj(rect.width() / rect.height().max(1.0)) * glam::Mat4::from_quat(self.display_rot);
+                    if let Some(b) = pick_joint(&world, vp, rect, pos) {
+                        self.sel_bone = Some(b);
+                        self.bone_drag = true;
+                        self.playing = false;
+                    }
+                }
+            }
+        }
+        if !resp.dragged() {
+            self.bone_drag = false;
+        }
+        let manip = (ctrl || self.bone_drag) && self.sel_bone.is_some() && resp.dragged_by(egui::PointerButton::Primary);
         if !manip {
             self.camera.handle_input(&resp, ui);
         }
@@ -909,19 +934,8 @@ impl AnimatorTab {
         }
         // selection by click
         if resp.clicked() && !ctrl {
-            if let Some(pos) = resp.interact_pointer_pos() {
-                let mut best = (14.0f32, None);
-                for i in 0..world.len() {
-                    if let Some(sp) = render::project(vp, rect, world[i].translation.into()) {
-                        let d = sp.distance(pos);
-                        if d < best.0 {
-                            best = (d, Some(i));
-                        }
-                    }
-                }
-                if best.1.is_some() {
-                    self.sel_bone = best.1;
-                }
+            if let Some(b) = resp.interact_pointer_pos().and_then(|pos| pick_joint(&world, vp, rect, pos)) {
+                self.sel_bone = Some(b);
             }
         }
         render::paint_viewport(ui, rect, sh.renderer.clone(), f);
@@ -1120,4 +1134,18 @@ impl AnimatorTab {
             }
         };
     }
+}
+
+/// The joint whose screen position is nearest `pos` (within 14 px), if any.
+fn pick_joint(world: &[Affine3A], vp: glam::Mat4, rect: egui::Rect, pos: egui::Pos2) -> Option<usize> {
+    let mut best = (14.0f32, None);
+    for (i, w) in world.iter().enumerate() {
+        if let Some(sp) = render::project(vp, rect, w.translation.into()) {
+            let d = sp.distance(pos);
+            if d < best.0 {
+                best = (d, Some(i));
+            }
+        }
+    }
+    best.1
 }

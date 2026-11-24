@@ -9,14 +9,18 @@ use golden_stunstick::gamefs::GameFs;
 use golden_stunstick::verify;
 use std::path::PathBuf;
 
-fn tf2_dir() -> Option<PathBuf> {
-    let p = std::env::var("GS_TF2_DIR").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from(r"C:\Program Files (x86)\Steam\steamapps\common\Team Fortress 2"));
-    (p.join("tf").join("gameinfo.txt").is_file() && p.join("bin").join("studiomdl.exe").is_file()).then_some(p)
+/// (gameinfo.txt, studiomdl.exe). Defaults to TF2; override with GS_RT_GAMEINFO / GS_RT_STUDIOMDL
+/// (or GS_TF2_DIR for another TF2 install).
+fn game_and_studiomdl() -> Option<(PathBuf, PathBuf)> {
+    let tf = std::env::var("GS_TF2_DIR").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from(r"C:\Program Files (x86)\Steam\steamapps\common\Team Fortress 2"));
+    let gameinfo = std::env::var("GS_RT_GAMEINFO").map(PathBuf::from).unwrap_or_else(|_| tf.join("tf").join("gameinfo.txt"));
+    let studiomdl = std::env::var("GS_RT_STUDIOMDL").map(PathBuf::from).unwrap_or_else(|_| tf.join("bin").join("studiomdl.exe"));
+    (gameinfo.is_file() && studiomdl.is_file()).then_some((gameinfo, studiomdl))
 }
 
 fn roundtrip(model: &str) -> bool {
-    let Some(tf) = tf2_dir() else { return true };
-    let fs = GameFs::mount(&tf.join("tf").join("gameinfo.txt"), None).unwrap();
+    let Some((gameinfo, studiomdl)) = game_and_studiomdl() else { return true };
+    let fs = GameFs::mount(&gameinfo, None).unwrap();
     let input = DecompileInput::from_gamefs(&fs, model).unwrap();
     let work = std::env::temp_dir().join("gs_roundtrip").join(model.replace('/', "_"));
     let _ = std::fs::remove_dir_all(&work);
@@ -29,7 +33,7 @@ fn roundtrip(model: &str) -> bool {
     }
     let game = work.join("game");
     compile::make_temp_game(&game, Some(&fs)).unwrap();
-    let job = CompileJob { studiomdl: tf.join("bin").join("studiomdl.exe"), game_dir: game.clone(), qc: report.qc_path.clone().unwrap(), extra_args: vec!["-nox360".into()] };
+    let job = CompileJob { studiomdl: studiomdl.clone(), game_dir: game.clone(), qc: report.qc_path.clone().unwrap(), extra_args: vec!["-nox360".into()] };
     let (tx, rx) = std::sync::mpsc::channel();
     compile::run(&job, &tx);
     drop(tx);

@@ -46,8 +46,26 @@ folder.
 
 **Sequence** – searchable list (name and activity), play/pause, frame stepping, loop, speed
 (0–4×), frame slider, **pose parameters**, and the selected sequence's details: frame count,
-looping/delta, blend grid, events (frame, event name/number, options). By default a full-body
-idle (`stand_*`, `*idle*`) is chosen; delta (additive) layers are not auto-selected.
+looping/delta, blend grid, events (frame, event name/number, options, and the sound it plays
+with a **Play** button). By default a full-body idle (`stand_*`, `*idle*`) is chosen; delta
+(additive) layers are not auto-selected.
+
+**Event sounds** – while a sequence plays, its animation events play their sounds the way the game
+does (turn off with *Play event sounds*; *Volume* sets the level). Sounds are looked up in the
+game's soundscripts (`scripts/game_sounds_manifest.txt` and every file it lists, loaded in the
+background), with the random wave, volume and pitch of each entry; `$gender` in wave paths becomes
+`male` or `female` from the model's name. Supported events:
+
+| Event | Sound |
+|---|---|
+| `AE_CL_PLAYSOUND`, `AE_SV_PLAYSOUND`, `AE_CL_EXCLUDE_PLAYER_SOUND` and other `*SOUND` events, `5004` (CL_EVENT_SOUND), `1004`, `1008` | the gamesound (or wave) named in the options |
+| `6004` / `6005` (NPC footsteps) | `<options>.FootstepLeft/Right` (`RunFootstep…` in run sequences); default `NPC_CombineS` |
+| `6006`–`6009` (material footsteps), TF2 `7001` (`left` / `right`) | `Concrete.StepLeft/Right` (the viewer has no ground surface) |
+| HL2 zombie / antlion step and attack events | the NPC's own footstep / attack gamesounds |
+
+WAV (PCM 8/16/24/32-bit, float, MS-ADPCM, MP3-in-WAV) and MP3 files are decoded. Models whose
+footsteps come from game code rather than animation events (HL2MP players such as
+`john_freeman`, which has no events at all) have no footsteps to play.
 
 Pose parameters (`move_x`, `move_y`, `body_yaw`, `body_pitch`, …) are collected from the model
 *and* its `$includemodel`s, matched by name as the engine does. Each one has a slider and a

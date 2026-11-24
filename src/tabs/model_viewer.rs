@@ -4,6 +4,7 @@ use crate::app::Shared;
 use crate::gamefs::{GameFs, ModelEntry};
 use crate::render::{self, FrameData, OrbitCamera, RenderMode};
 use crate::scene::{ModelOrigin, ModelScene};
+use crate::sound::{self, SoundScripts};
 use eframe::egui::{self, Color32, RichText};
 use glam::{Affine3A, Quat, Vec3};
 use std::sync::Arc;
@@ -118,7 +119,28 @@ pub struct ModelViewerTab {
     filter_source: Option<usize>,
     only_overridden: bool,
     pending_screenshot: bool,
+    cli_shot: Option<CliShot>,
     wanted_seq: Option<String>,
+    // event sounds
+    sounds_on: bool,
+    sound_volume: f32,
+    audio: crate::sound::Player,
+    scripts: Option<Arc<SoundScripts>>,
+    scripts_loading: Option<Receiver<SoundScripts>>,
+    /// the GameFs the soundscripts were loaded from (pointer identity)
+    scripts_for: usize,
+    /// (sequence, frame) up to which events have fired
+    event_cursor: Option<(usize, f32)>,
+    last_sound: String,
+}
+
+/// A `--screenshot` request from the command line.
+struct CliShot {
+    path: std::path::PathBuf,
+    focus: Option<(String, f32)>,
+    /// frames rendered with the model loaded
+    frames: u32,
+    taken: bool,
 }
 
 impl Default for ModelViewerTab {
@@ -174,7 +196,16 @@ impl Default for ModelViewerTab {
             filter_source: None,
             only_overridden: false,
             pending_screenshot: false,
+            cli_shot: None,
             wanted_seq: None,
+            sounds_on: true,
+            sound_volume: 0.7,
+            audio: crate::sound::Player::default(),
+            scripts: None,
+            scripts_loading: None,
+            scripts_for: 0,
+            event_cursor: None,
+            last_sound: String::new(),
         }
     }
 }
@@ -266,6 +297,17 @@ impl ModelViewerTab {
         };
     }
 
+    /// `--screenshot <png> [--focus-bone <bone> [--focus-dist <units>]]`: once the model has
+    /// loaded and rendered for a moment, save the viewport to `path` and close the app.
+    pub fn cli_screenshot(&mut self, path: std::path::PathBuf, focus: Option<(String, f32)>) {
+        self.cli_shot = Some(CliShot { path, focus, frames: 0, taken: false });
+    }
+
+    /// `--no-sound`: start with event sounds off.
+    pub fn set_sounds(&mut self, on: bool) {
+        self.sounds_on = on;
+    }
+
     pub fn request_model(&mut self, sh: &Shared, path: &str, seq: Option<String>) {
         self.wanted_seq = seq;
         self.loading_label = path.to_string();
@@ -297,6 +339,26 @@ impl ModelViewerTab {
                     }
                     Err(e) => sh.error(e),
                 }
+            }
+        }
+        // soundscripts of the mounted game, loaded once per mount in the background
+        if let Some(fs) = &sh.fs {
+            let id = Arc::as_ptr(fs) as usize;
+            if self.scripts_for != id {
+                self.scripts_for = id;
+                self.scripts = None;
+                let fs = fs.clone();
+                let (tx, rx) = std::sync::mpsc::channel();
+                std::thread::spawn(move || {
+                    let _ = tx.send(SoundScripts::load(&fs));
+                });
+                self.scripts_loading = Some(rx);
+            }
+        }
+        if let Some(rx) = &self.scripts_loading {
+            if let Ok(s) = rx.try_recv() {
+                self.scripts = Some(Arc::new(s));
+                self.scripts_loading = None;
             }
         }
         self.queue_textures(sh);
@@ -424,7 +486,7 @@ impl ModelViewerTab {
                 });
                 ui.label(RichText::new("Mouse: left-drag rotate, right-drag zoom, middle/shift-drag pan, wheel zoom.").small().weak());
             }
-            Panel::Sequence => self.sequence_panel(ui),
+            Panel::Sequence => self.sequence_panel(ui, sh),
             Panel::Body => {
                 let m = scene.main();
                 egui::Grid::new("bodygroups").num_columns(2).show(ui, |ui| {
@@ -673,7 +735,16 @@ impl ModelViewerTab {
         }
     }
 
-    fn sequence_panel(&mut self, ui: &mut egui::Ui) {
+    fn sequence_panel(&mut self, ui: &mut egui::Ui, sh: &Shared) {
+        let mut play_now: Option<Vec<String>> = None;
+        self.sequence_panel_inner(ui, &mut play_now);
+        if let Some(names) = play_now {
+            let model = self.scene.as_ref().map(|s| s.path.clone()).unwrap_or_default();
+            self.play_first(&names, sh, &model);
+        }
+    }
+
+    fn sequence_panel_inner(&mut self, ui: &mut egui::Ui, play_now: &mut Option<Vec<String>>) {
         let Some(scene) = &self.scene else { return };
         ui.horizontal(|ui| {
             if ui.button(if self.playing { "Pause" } else { "Play" }).clicked() {
@@ -698,6 +769,18 @@ impl ModelViewerTab {
                 ui.label("Frame");
                 ui.add(egui::Slider::new(&mut self.frame, 0.0..=max.max(0.001)).max_decimals(1));
                 ui.label(format!("/ {}  @ {:.0} fps", sq.frames - 1, sq.fps));
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut self.sounds_on, "Play event sounds").on_hover_text("Plays the sounds of the sequence's animation events (footsteps, AE_CL_PLAYSOUND, ...) through the game's soundscripts");
+            ui.label("Volume");
+            ui.add(egui::Slider::new(&mut self.sound_volume, 0.0..=1.5).show_value(false));
+            if let Some(e) = self.audio.error() {
+                ui.colored_label(Color32::from_rgb(240, 120, 100), format!("No audio device: {e}"));
+            } else if self.scripts_loading.is_some() {
+                ui.label(RichText::new("loading soundscripts...").weak());
+            } else if !self.last_sound.is_empty() {
+                ui.label(RichText::new(format!("Last: {}", self.last_sound)).weak());
             }
         });
         ui.horizontal_top(|ui| {
@@ -743,6 +826,9 @@ impl ModelViewerTab {
                         }
                     });
                 }
+            });
+            ui.separator();
+            ui.vertical(|ui| {
                 if let Some(sr) = scene.seqs.get(self.seq) {
                     let src = &scene.sources[sr.source];
                     let sd = &src.mdl.seqs[sr.index];
@@ -752,8 +838,20 @@ impl ModelViewerTab {
                     }
                     if !sd.events.is_empty() {
                         ui.label("Events:");
+                        let running = sd.name.to_ascii_lowercase().contains("run");
                         for e in &sd.events {
-                            ui.label(RichText::new(format!("  frame {:.1}: {} {}", e.cycle * (sr.frames - 1).max(1) as f32, if e.name.is_empty() { e.event.to_string() } else { e.name.clone() }, e.options)).monospace());
+                            let names = sound::event_sounds(e.event, &e.name, &e.options, running);
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new(format!("  frame {:.1}: {} {}", e.cycle * (sr.frames - 1).max(1) as f32, if e.name.is_empty() { e.event.to_string() } else { e.name.clone() }, e.options)).monospace());
+                                if let Some(n) = names.first() {
+                                    let known = self.scripts.as_ref().map(|s| names.iter().any(|x| s.get(x).is_some()));
+                                    let txt = RichText::new(format!("sound: {n}")).small();
+                                    ui.label(if known == Some(false) { txt.weak() } else { txt.color(Color32::from_rgb(150, 210, 255)) });
+                                    if ui.small_button("Play").clicked() {
+                                        *play_now = Some(names.clone());
+                                    }
+                                }
+                            });
                         }
                     }
                 }
@@ -880,20 +978,57 @@ impl ModelViewerTab {
         let dt = self.last_tick.map(|t| now.duration_since(t).as_secs_f32()).unwrap_or(0.0).min(0.1);
         self.last_tick = Some(now);
         let mut labels: Vec<(egui::Pos2, String, Color32)> = Vec::new();
+        let mut fire: Vec<Vec<String>> = Vec::new();
         if let Some(scene) = &self.scene {
             if let Some(sq) = scene.seqs.get(self.seq) {
                 let max = (sq.frames - 1).max(0) as f32;
+                let prev = self.frame;
+                let mut wrapped = false;
                 if self.playing && max > 0.0 {
                     self.frame += dt * sq.fps * self.speed;
                     if self.frame > max {
+                        wrapped = self.looping;
                         self.frame = if self.looping { self.frame % max.max(1e-3) } else { max };
                     }
                     ui.ctx().request_repaint();
                 }
                 self.frame = self.frame.clamp(0.0, max);
+                // animation events whose frame was passed since the last tick
+                if self.playing && self.sounds_on && sh.fs.is_some() {
+                    let from = match self.event_cursor {
+                        Some((s, f)) if s == self.seq && (f - prev).abs() < 1e-3 => Some(f),
+                        _ => None, // (re)started: include events on the current frame
+                    };
+                    let sd = &scene.sources[sq.source].mdl.seqs[sq.index];
+                    let running = sd.name.to_ascii_lowercase().contains("run");
+                    let hit = |ef: f32| -> bool {
+                        let after = |a: Option<f32>| a.map(|a| ef > a).unwrap_or(ef >= prev - 1e-4);
+                        if wrapped { after(from) || ef <= self.frame } else { after(from) && ef <= self.frame }
+                    };
+                    for e in &sd.events {
+                        if hit(e.cycle * max) {
+                            let names = sound::event_sounds(e.event, &e.name, &e.options, running);
+                            if !names.is_empty() {
+                                fire.push(names);
+                            }
+                        }
+                    }
+                }
+                self.event_cursor = if self.playing { Some((self.seq, self.frame)) } else { None };
             }
             let pose = if scene.seqs.is_empty() { scene.bind_pose() } else { scene.sequence_pose(self.seq, self.frame, &self.pose_params) };
             let world = scene.world(&pose);
+            if let Some(shot) = &mut self.cli_shot {
+                // --focus-bone: keep the camera on that bone (applies from the next frame)
+                if let Some((name, dist)) = &shot.focus {
+                    if let Some(bi) = scene.bones().iter().position(|b| b.name.eq_ignore_ascii_case(name)) {
+                        self.camera.target = world[bi].translation.into();
+                        self.camera.distance = *dist;
+                        self.camera.pitch = 0.0;
+                    }
+                }
+                shot.frames += 1;
+            }
             let body: i32 = scene.main().bodyparts.iter().enumerate().map(|(i, bp)| bp.base * self.bodygroups.get(i).copied().unwrap_or(0) as i32).sum();
             let flex_w = if scene.main().flex_descs.is_empty() { None } else { Some(scene.flex_weights(&self.flex_values)) };
             let tint = if self.use_custom_paint {
@@ -989,6 +1124,22 @@ impl ModelViewerTab {
                 }
             }
         }
+        if !fire.is_empty() {
+            let model = self.scene.as_ref().map(|s| s.path.clone()).unwrap_or_default();
+            for names in fire {
+                self.play_first(&names, sh, &model);
+            }
+        }
+        if let Some(shot) = &mut self.cli_shot {
+            if shot.taken {
+                // the screenshot was written during the previous paint
+                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+            } else if shot.frames >= 30 {
+                f.screenshot = Some(shot.path.clone());
+                shot.taken = true;
+            }
+            ui.ctx().request_repaint();
+        }
         if self.pending_screenshot {
             self.pending_screenshot = false;
             let name = format!("screenshot_{}.png", chrono::Local::now().format("%Y%m%d_%H%M%S"));
@@ -1008,6 +1159,20 @@ impl ModelViewerTab {
             painter.text(rect.center(), egui::Align2::CENTER_CENTER, "No model loaded", egui::FontId::proportional(18.0), Color32::from_white_alpha(120));
         }
         let _ = Quat::IDENTITY;
+    }
+}
+
+impl ModelViewerTab {
+    /// Play the first of `names` (gamesounds or waves) that exists in the mounted game.
+    fn play_first(&mut self, names: &[String], sh: &Shared, model: &str) {
+        let Some(fs) = sh.fs.as_deref() else { return };
+        for n in names {
+            if let Some(w) = self.audio.play(n, self.scripts.as_deref(), fs, model, self.sound_volume) {
+                self.last_sound = format!("{n}  ({w})");
+                return;
+            }
+        }
+        self.last_sound = format!("{}: not found in the game's sounds", names[0]);
     }
 }
 

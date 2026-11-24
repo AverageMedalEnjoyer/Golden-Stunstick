@@ -4,7 +4,7 @@
 mod app;
 mod tabs;
 
-pub use golden_stunstick::{anim, compile, decompile, formats, gamefs, render, scene, verify};
+pub use golden_stunstick::{anim, compile, decompile, formats, gamefs, render, scene, sound, verify};
 
 /// The window / taskbar icon, embedded in the EXE.
 pub const ICON_PNG: &[u8] = include_bytes!("../assets/Stunstick_Icon.png");

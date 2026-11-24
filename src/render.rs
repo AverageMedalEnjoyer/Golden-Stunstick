@@ -49,6 +49,20 @@ pub struct DrawCall {
     pub cull: bool,
     pub tint: [f32; 4],
     pub selfillum: bool,
+    /// eyeball iris projected from world position (Eyes / EyeRefract shaders)
+    pub iris: Option<IrisDraw>,
+}
+
+#[derive(Clone, Debug)]
+pub struct IrisDraw {
+    pub texture: String,
+    /// iris texture u = dot(u.xyz, world_pos) + u.w (same for v)
+    pub u: [f32; 4],
+    pub v: [f32; 4],
+    /// true: the iris replaces the base (EyeRefract); false: blended over it by iris alpha (Eyes)
+    pub replace: bool,
+    /// EyeRefract `$dilation` (0.5 leaves the pupil as painted)
+    pub dilation: f32,
 }
 
 /// Everything needed to draw one viewport for one frame.
@@ -131,6 +145,7 @@ const MESH_FS: &str = r#"
 in vec3 v_normal; in vec2 v_uv; in vec3 v_pos;
 uniform sampler2D u_tex; uniform int u_mode; uniform vec3 u_light; uniform vec4 u_tint;
 uniform float u_alpha_ref; uniform float u_ambient; uniform int u_selfillum; uniform int u_wire;
+uniform int u_iris; uniform sampler2D u_iris_tex; uniform vec4 u_iris_u; uniform vec4 u_iris_v; uniform float u_iris_dil;
 out vec4 frag;
 void main() {
     if (u_wire == 1) { frag = u_tint; return; }
@@ -141,6 +156,19 @@ void main() {
     float light = u_ambient + (1.0 - u_ambient) * hl * hl;
     vec4 base = vec4(0.82, 0.82, 0.82, 1.0);
     if (u_mode == 3) { base = texture(u_tex, v_uv); }
+    if (u_mode == 3 && u_iris != 0) {
+        vec2 iuv = vec2(dot(u_iris_u.xyz, v_pos) + u_iris_u.w, dot(u_iris_v.xyz, v_pos) + u_iris_v.w);
+        if (u_iris == 2) {
+            // EyeRefract (eye_refract_ps2x.fxc): the iris texture spans twice the projection
+            // ("sphere uv"), then the pupil is dilated about the centre (iris radius 0.2)
+            vec2 c = iuv * 0.5 - 0.25;
+            float f = clamp(length(c) / 0.2, 0.0, 1.0);
+            c *= mix(1.0, f, clamp(u_iris_dil, 0.0, 1.0) * 2.5 - 1.25);
+            iuv = c + 0.5;
+        }
+        vec4 iris = texture(u_iris_tex, iuv);
+        if (u_iris == 2) { base = vec4(iris.rgb, 1.0); } else { base.rgb = mix(base.rgb, iris.rgb, iris.a); }
+    }
     if (u_alpha_ref > 0.0 && base.a < u_alpha_ref) discard;
     vec3 col = base.rgb * u_tint.rgb;
     if (u_selfillum == 0) { col *= light; }
@@ -281,6 +309,9 @@ impl Renderer {
                 gl.uniform_3_f32(u("u_light").as_ref(), l.x, l.y, l.z);
                 gl.uniform_1_f32(u("u_ambient").as_ref(), f.ambient);
                 gl.uniform_1_i32(u("u_tex").as_ref(), 0);
+                gl.uniform_1_i32(u("u_iris_tex").as_ref(), 1);
+                gl.active_texture(glow::TEXTURE1);
+                gl.bind_texture(glow::TEXTURE_2D, Some(self.white));
                 gl.active_texture(glow::TEXTURE0);
                 let mode = f.mode.unwrap_or(RenderMode::Textured);
                 let mode_i = match mode {
@@ -322,6 +353,18 @@ impl Renderer {
                         }
                         let tex = d.texture.as_ref().and_then(|k| self.textures.get(k)).copied().unwrap_or(self.white);
                         gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+                        match d.iris.as_ref().and_then(|i| self.textures.get(&i.texture).map(|t| (i, *t))) {
+                            Some((i, t)) => {
+                                gl.active_texture(glow::TEXTURE1);
+                                gl.bind_texture(glow::TEXTURE_2D, Some(t));
+                                gl.active_texture(glow::TEXTURE0);
+                                gl.uniform_1_i32(u("u_iris").as_ref(), if i.replace { 2 } else { 1 });
+                                gl.uniform_4_f32(u("u_iris_u").as_ref(), i.u[0], i.u[1], i.u[2], i.u[3]);
+                                gl.uniform_4_f32(u("u_iris_v").as_ref(), i.v[0], i.v[1], i.v[2], i.v[3]);
+                                gl.uniform_1_f32(u("u_iris_dil").as_ref(), i.dilation);
+                            }
+                            None => gl.uniform_1_i32(u("u_iris").as_ref(), 0),
+                        }
                         gl.uniform_1_i32(u("u_mode").as_ref(), mode_i);
                         gl.uniform_1_f32(u("u_alpha_ref").as_ref(), if mode == RenderMode::Textured { d.alpha_ref } else { 0.0 });
                         gl.uniform_1_i32(u("u_selfillum").as_ref(), d.selfillum as i32);
@@ -501,6 +544,189 @@ impl OrbitCamera {
             }
         }
         changed
+    }
+}
+
+/// Free-fly camera (Animator): WASD / QE flying with smooth acceleration, right-drag to look,
+/// left-drag to orbit the focus point, middle-drag to pan, smooth scroll dolly and smooth
+/// "fly to" framing.
+#[derive(Clone, Debug)]
+pub struct FlyCamera {
+    pub eye: Vec3,
+    /// heading of the view direction (radians, 0 = +X)
+    pub yaw: f32,
+    /// elevation of the view direction (radians, positive = looking up)
+    pub pitch: f32,
+    pub fov: f32,
+    /// distance from the eye to the orbit / focus point in front of it
+    pub focus: f32,
+    /// flying speed in units per second (before Shift / scroll multipliers)
+    pub speed: f32,
+    /// scroll-adjusted speed multiplier while flying
+    pub speed_mul: f32,
+    pub near: f32,
+    vel: Vec3,
+    dolly: f32,
+    fly_to: Option<(Vec3, f32)>,
+}
+
+impl Default for FlyCamera {
+    fn default() -> Self {
+        let mut c = FlyCamera { eye: Vec3::ZERO, yaw: 180f32.to_radians(), pitch: -10f32.to_radians(), fov: 65.0, focus: 120.0, speed: 80.0, speed_mul: 1.0, near: 0.2, vel: Vec3::ZERO, dolly: 0.0, fly_to: None };
+        c.eye = Vec3::new(0.0, 0.0, 36.0) - c.forward() * c.focus;
+        c
+    }
+}
+
+impl FlyCamera {
+    pub fn forward(&self) -> Vec3 {
+        Vec3::new(self.pitch.cos() * self.yaw.cos(), self.pitch.cos() * self.yaw.sin(), self.pitch.sin())
+    }
+    pub fn right(&self) -> Vec3 {
+        self.forward().cross(Vec3::Z).normalize_or(Vec3::Y)
+    }
+    pub fn up(&self) -> Vec3 {
+        self.right().cross(self.forward()).normalize_or(Vec3::Z)
+    }
+    /// The orbit / focus point.
+    pub fn target(&self) -> Vec3 {
+        self.eye + self.forward() * self.focus
+    }
+
+    pub fn view_proj(&self, aspect: f32) -> Mat4 {
+        let view = glam::camera::rh::view::look_at_mat4(self.eye, self.eye + self.forward(), Vec3::Z);
+        let proj = glam::camera::rh::proj::opengl::perspective(self.fov.to_radians(), aspect.max(0.01), self.near, self.near * 200_000.0);
+        proj * view
+    }
+
+    /// World units per screen pixel at `depth` in front of the camera.
+    pub fn units_per_pixel(&self, depth: f32, viewport_height: f32) -> f32 {
+        2.0 * depth.max(self.near) * (self.fov.to_radians() * 0.5).tan() / viewport_height.max(1.0)
+    }
+
+    /// Frame a bounding box (instantly); also sets the flying speed and near plane from its size.
+    pub fn frame_bounds(&mut self, min: Vec3, max: Vec3) {
+        let radius = ((max - min).length() * 0.5).max(1.0);
+        self.focus = radius / (self.fov.to_radians() * 0.5).tan() * 1.1;
+        self.eye = (min + max) * 0.5 - self.forward() * self.focus;
+        self.speed = radius * 1.2;
+        self.near = (radius * 0.002).clamp(0.01, 4.0);
+        self.vel = Vec3::ZERO;
+        self.fly_to = None;
+        self.dolly = 0.0;
+    }
+
+    /// Smoothly fly so that `point` is centred `distance` in front of the camera.
+    pub fn fly_to(&mut self, point: Vec3, distance: f32) {
+        self.fly_to = Some((point, distance.max(self.near * 4.0)));
+    }
+
+    fn orbit(&mut self, dx: f32, dy: f32) {
+        let t = self.target();
+        self.yaw -= dx * 0.01;
+        self.pitch = (self.pitch - dy * 0.01).clamp(-1.55, 1.55);
+        self.eye = t - self.forward() * self.focus;
+    }
+
+    /// Mouse + keyboard input. `orbit_ok` is false while the left button is used for something
+    /// else (posing a bone). Returns true while the camera is still moving (repaint needed).
+    pub fn handle_input(&mut self, resp: &egui::Response, ui: &egui::Ui, orbit_ok: bool) -> bool {
+        let dt = ui.input(|i| i.stable_dt).clamp(0.0, 0.1);
+        let (shift, ctrl, alt) = ui.input(|i| (i.modifiers.shift, i.modifiers.ctrl, i.modifiers.alt));
+        let mut user = false;
+        // right-drag: look around
+        let looking = resp.dragged_by(egui::PointerButton::Secondary);
+        if looking {
+            let d = resp.drag_delta();
+            self.yaw -= d.x * 0.005;
+            self.pitch = (self.pitch - d.y * 0.005).clamp(-1.55, 1.55);
+            user = true;
+        }
+        if orbit_ok && resp.dragged_by(egui::PointerButton::Primary) && !shift && !ctrl {
+            let d = resp.drag_delta();
+            self.orbit(d.x, d.y);
+            user = true;
+        }
+        if resp.dragged_by(egui::PointerButton::Middle) || (orbit_ok && resp.dragged_by(egui::PointerButton::Primary) && shift) {
+            let d = resp.drag_delta();
+            let s = self.units_per_pixel(self.focus, resp.rect.height());
+            self.eye += (-self.right() * d.x + self.up() * d.y) * s;
+            user = true;
+        }
+        // keyboard flying while the pointer is over the viewport (or while looking)
+        let keys_ok = (resp.hovered() || looking) && !ui.ctx().egui_wants_keyboard_input() && !ctrl;
+        let mut dir = Vec3::ZERO;
+        if keys_ok {
+            ui.input(|i| {
+                let k = |key| i.key_down(key);
+                if k(egui::Key::W) || k(egui::Key::ArrowUp) {
+                    dir += self.forward();
+                }
+                if k(egui::Key::S) || k(egui::Key::ArrowDown) {
+                    dir -= self.forward();
+                }
+                if k(egui::Key::D) || k(egui::Key::ArrowRight) {
+                    dir += self.right();
+                }
+                if k(egui::Key::A) || k(egui::Key::ArrowLeft) {
+                    dir -= self.right();
+                }
+                if k(egui::Key::E) {
+                    dir += Vec3::Z;
+                }
+                if k(egui::Key::Q) {
+                    dir -= Vec3::Z;
+                }
+            });
+        }
+        let mul = self.speed_mul * if shift { 3.0 } else if alt { 0.25 } else { 1.0 };
+        let want = dir.normalize_or_zero() * self.speed * mul;
+        let k = 1.0 - (-dt * 10.0).exp();
+        self.vel = self.vel.lerp(want, k);
+        if self.vel.length() < self.speed * 0.002 && want == Vec3::ZERO {
+            self.vel = Vec3::ZERO;
+        }
+        if self.vel != Vec3::ZERO {
+            self.eye += self.vel * dt;
+            user = true;
+        }
+        // scroll: change the flying speed while looking, otherwise a smooth dolly toward the focus
+        if resp.hovered() || looking {
+            let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+            if scroll != 0.0 {
+                if looking || dir != Vec3::ZERO {
+                    self.speed_mul = (self.speed_mul * (1.0 + scroll * 0.002)).clamp(0.05, 20.0);
+                } else {
+                    self.dolly += scroll * 0.0015 * self.focus.max(self.near * 10.0);
+                }
+            }
+        }
+        if self.dolly.abs() > self.near * 0.01 {
+            let step = self.dolly * (1.0 - (-dt * 12.0).exp());
+            self.dolly -= step;
+            self.eye += self.forward() * step;
+            // keep the focus point ahead; pushing through it carries it along
+            self.focus = (self.focus - step).max(self.near * 8.0);
+            user = true;
+        } else {
+            self.dolly = 0.0;
+        }
+        if user {
+            self.fly_to = None;
+        }
+        if let Some((p, dist)) = self.fly_to {
+            let goal = p - self.forward() * dist;
+            let k = 1.0 - (-dt * 8.0).exp();
+            self.eye = self.eye.lerp(goal, k);
+            self.focus += (dist - self.focus) * k;
+            if (self.eye - goal).length() < self.near * 0.5 {
+                self.eye = goal;
+                self.focus = dist;
+                self.fly_to = None;
+            }
+            return true;
+        }
+        user || self.vel != Vec3::ZERO || self.dolly != 0.0 || dir != Vec3::ZERO
     }
 }
 

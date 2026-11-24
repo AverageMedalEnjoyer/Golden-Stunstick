@@ -107,47 +107,132 @@ fn locate(line: &str) -> Option<(PathBuf, usize)> {
 
 struct Rule {
     needles: &'static [&'static str],
+    /// true: every needle must appear; false: any one of them is enough.
+    all: bool,
     short: &'static str,
     fix: &'static str,
 }
 
 const RULES: &[Rule] = &[
-    Rule { needles: &["too many bones"], short: "Too many bones (studiomdl limit is 128 per model / 53 per mesh batch)", fix: "Remove unused bones, merge helper bones, or split the model into several models joined with bonemerge." },
-    Rule { needles: &["bad command", "unknown command"], short: "Unknown QC command", fix: "Check the command's spelling against the Valve Developer Wiki. Commands must start with '$' and options must be inside the right { } block." },
-    Rule { needles: &["unknown bone", "couldn't find bone", "could not find bone", "unknown bonename", "can't find bone", "bone not found"], short: "A bone named in the QC does not exist in the meshes", fix: "Check the bone's spelling (it is case sensitive in some commands) and that the SMD that defines the bone is loaded before this line." },
-    Rule { needles: &["could not load file", "can't open", "cannot open", "unable to open", "failed to open", "file not found", "couldn't open", "could not open"], short: "A file referenced by the QC could not be opened", fix: "Make sure the path is relative to the QC's folder, the file exists, and the extension is right (.smd / .dmx / .vta / .qci)." },
-    Rule { needles: &["too many verts", "too many vertices", "vertex limit", "max verts"], short: "Mesh has too many vertices", fix: "Split the mesh into several meshes/materials or bodygroups (limit is 65535 vertices per mesh, 32k per strip group on older branches)." },
-    Rule { needles: &["material", "not found"], short: "Material not found", fix: "Check $cdmaterials points at the folder that contains the .vmt, and that the material name in the SMD matches the VMT file name." },
-    Rule { needles: &["unexpected end of file", "end of file", "eof"], short: "Unexpected end of file (usually a missing '}' or quote)", fix: "Count the { and } in the QC/QCI; every block opened with '{' must be closed with '}'. Also check for a missing closing quote." },
-    Rule { needles: &["expecting '{'", "expected '{'", "missing '{'"], short: "Missing '{'", fix: "This command needs a { } block. Put '{' after the command's arguments." },
-    Rule { needles: &["duplicate sequence", "sequence name", "already exists"], short: "Duplicate name", fix: "Every $sequence/$animation must have a unique name. Rename one of them." },
-    Rule { needles: &["bone weight", "weight"], short: "Bad vertex bone weights", fix: "Normalize the weights in your 3D package and limit vertices to at most 3 bone influences." },
-    Rule { needles: &["no triangles", "0 triangles", "empty mesh"], short: "Mesh contains no triangles", fix: "Re-export the SMD with the mesh selected/visible, or remove the empty $body / studio line." },
-    Rule { needles: &["too many textures", "too many materials", "max materials"], short: "Too many materials", fix: "Reduce the number of unique materials (combine textures into an atlas)." },
-    Rule { needles: &["$modelname"], short: "Problem with $modelname", fix: "$modelname must be set once, with a path relative to models/ ending in .mdl, e.g.  $modelname \"props/thing.mdl\"" },
-    Rule { needles: &["gameinfo", "-game"], short: "studiomdl could not find the game", fix: "Check the session's gameinfo.txt path; studiomdl is run with -game <folder that contains gameinfo.txt>." },
-    Rule { needles: &["$includemodel", "include model"], short: "Included model problem", fix: "Make sure every $includemodel exists in the mounted game (e.g. models/player/heavy_animations.mdl) and has the same skeleton." },
-    Rule { needles: &["collision", "convex", "phy"], short: "Collision model problem", fix: "Keep collision meshes convex per piece, under 20 pieces (or use $maxconvexpieces), and give every piece a bone. Use $concave for multi-piece props." },
-    Rule { needles: &["frame", "out of range"], short: "Frame number out of range", fix: "An event, ikrule or option references a frame past the end of the animation. Use a frame between 0 and (number of frames - 1)." },
+    Rule { needles: &["too many bones"], all: false, short: "Too many bones (studiomdl limit is 128 per model / 53 per mesh batch)", fix: "Remove unused bones, merge helper bones, or split the model into several models joined with bonemerge." },
+    Rule { needles: &["bad command", "unknown command"], all: false, short: "Unknown QC command", fix: "Check the command's spelling against the Valve Developer Wiki. Commands must start with '$' and options must be inside the right { } block." },
+    Rule { needles: &["unknown bone", "couldn't find bone", "could not find bone", "unknown bonename", "can't find bone", "bone not found"], all: false, short: "A bone named in the QC does not exist in the meshes", fix: "Check the bone's spelling (it is case sensitive in some commands) and that the SMD that defines the bone is loaded before this line." },
+    Rule { needles: &["could not load file", "can't open", "cannot open", "unable to open", "failed to open", "file not found", "couldn't open", "could not open"], all: false, short: "A file referenced by the QC could not be opened", fix: "Make sure the path is relative to the QC's folder, the file exists, and the extension is right (.smd / .dmx / .vta / .qci)." },
+    Rule { needles: &["too many verts", "too many vertices", "vertex limit", "max verts"], all: false, short: "Mesh has too many vertices", fix: "Split the mesh into several meshes/materials or bodygroups (limit is 65535 vertices per mesh, 32k per strip group on older branches)." },
+    Rule { needles: &["material", "not found"], all: true, short: "Material not found", fix: "Check $cdmaterials points at the folder that contains the .vmt, and that the material name in the SMD matches the VMT file name." },
+    Rule { needles: &["unexpected end of file", "end of file", "eof"], all: false, short: "Unexpected end of file (usually a missing '}' or quote)", fix: "Count the { and } in the QC/QCI; every block opened with '{' must be closed with '}'. Also check for a missing closing quote." },
+    Rule { needles: &["expecting '{'", "expected '{'", "missing '{'"], all: false, short: "Missing '{'", fix: "This command needs a { } block. Put '{' after the command's arguments." },
+    Rule { needles: &["duplicate sequence", "sequence name", "already exists"], all: false, short: "Duplicate name", fix: "Every $sequence/$animation must have a unique name. Rename one of them." },
+    Rule { needles: &["bone weight", "weight"], all: false, short: "Bad vertex bone weights", fix: "Normalize the weights in your 3D package and limit vertices to at most 3 bone influences." },
+    Rule { needles: &["no triangles", "0 triangles", "empty mesh"], all: false, short: "Mesh contains no triangles", fix: "Re-export the SMD with the mesh selected/visible, or remove the empty $body / studio line." },
+    Rule { needles: &["too many textures", "too many materials", "max materials"], all: false, short: "Too many materials", fix: "Reduce the number of unique materials (combine textures into an atlas)." },
+    Rule { needles: &["$modelname"], all: false, short: "Problem with $modelname", fix: "$modelname must be set once, with a path relative to models/ ending in .mdl, e.g.  $modelname \"props/thing.mdl\"" },
+    Rule { needles: &["gameinfo", "-game"], all: false, short: "studiomdl could not find the game", fix: "Check the session's gameinfo.txt path; studiomdl is run with -game <folder that contains gameinfo.txt>." },
+    Rule { needles: &["$includemodel", "include model"], all: false, short: "Included model problem", fix: "Make sure every $includemodel exists in the mounted game (e.g. models/player/heavy_animations.mdl) and has the same skeleton." },
+    Rule { needles: &["collision", "convex", "phy"], all: false, short: "Collision model problem", fix: "Keep collision meshes convex per piece, under 20 pieces (or use $maxconvexpieces), and give every piece a bone. Use $concave for multi-piece props." },
+    Rule { needles: &["frame", "out of range"], all: true, short: "Frame number out of range", fix: "An event, ikrule or option references a frame past the end of the animation. Use a frame between 0 and (number of frames - 1)." },
 ];
+
+/// Messages studiomdl prints that do not affect the compile. Reported as Info.
+const BENIGN: &[Rule] = &[
+    Rule { needles: &["p4lib.dll"], all: false, short: "Perforce library not found (harmless)", fix: "Nothing to fix: p4lib.dll is Valve's Perforce integration, and Golden Stunstick runs studiomdl with -nop4 so it is never used." },
+    Rule { needles: &["leaking", "elements"], all: true, short: "DMX elements not freed (harmless)", fix: "Nothing to fix: studiomdl reports this while cleaning up, usually after an earlier error stopped the compile. Fix the errors above it." },
+];
+
+fn rule_hit(r: &Rule, lower: &str) -> bool {
+    if r.all { r.needles.iter().all(|n| lower.contains(n)) } else { r.needles.iter().any(|n| lower.contains(n)) }
+}
 
 pub fn suggest(line: &str) -> Option<(&'static str, &'static str)> {
     let l = line.to_ascii_lowercase();
-    for r in RULES {
-        let all_needed = r.needles == ["material", "not found"];
-        let hit = if all_needed { r.needles.iter().all(|n| l.contains(n)) } else { r.needles.iter().any(|n| l.contains(n)) };
-        if hit {
-            return Some((r.short, r.fix));
+    RULES.iter().find(|r| rule_hit(r, &l)).map(|r| (r.short, r.fix))
+}
+
+/// studiomdl failed to launch a helper program (e.g. dmxconvert):
+///
+/// ```text
+/// WARNING: Could not execute the command:
+///    dmxconvert -allowdebug -i ... -o ...
+/// Windows gave the error message:
+///    "The system cannot find the file specified."
+/// ```
+struct ExecFailure {
+    /// Index of the "Could not execute the command" line.
+    at: usize,
+    /// Index of the "Windows gave the error message" line, if present.
+    reason_at: Option<usize>,
+    /// Program name, e.g. "dmxconvert".
+    tool: String,
+    /// Windows' reason, without quotes.
+    reason: String,
+}
+
+fn next_nonempty(lines: &[String], from: usize) -> Option<(usize, &str)> {
+    lines.iter().enumerate().skip(from).map(|(i, l)| (i, l.trim())).find(|(_, l)| !l.is_empty())
+}
+
+fn find_exec_failures(lines: &[String]) -> Vec<ExecFailure> {
+    let mut out = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        if !line.to_ascii_lowercase().contains("could not execute the command") {
+            continue;
         }
+        let Some((cmd_at, cmd)) = next_nonempty(lines, i + 1) else { continue };
+        let first = cmd.split_whitespace().next().unwrap_or("").trim_matches('"');
+        let tool = Path::new(first).file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+        let mut reason_at = None;
+        let mut reason = String::new();
+        if let Some((w, wl)) = next_nonempty(lines, cmd_at + 1) {
+            if wl.to_ascii_lowercase().starts_with("windows gave the error message") {
+                reason_at = Some(w);
+                if let Some((_, r)) = next_nonempty(lines, w + 1) {
+                    reason = r.trim_matches('"').to_string();
+                }
+            }
+        }
+        out.push(ExecFailure { at: i, reason_at, tool, reason });
     }
-    None
+    out
+}
+
+fn exec_failure_issue(f: &ExecFailure, qc: &Path) -> Issue {
+    let exe = format!("{}.exe", f.tool);
+    let not_found = f.reason.to_ascii_lowercase().contains("cannot find the file");
+    let message = if not_found {
+        format!("studiomdl could not find {exe}: {}", f.reason)
+    } else if f.reason.is_empty() {
+        format!("studiomdl could not run {exe}")
+    } else {
+        format!("studiomdl could not run {exe}: {}", f.reason)
+    };
+    let suggestion = if f.tool.eq_ignore_ascii_case("dmxconvert") {
+        "studiomdl runs dmxconvert.exe to upgrade DMX files saved in an older format. It is missing from this studiomdl's bin folder (some branches, such as Left 4 Dead, don't ship it). Use a studiomdl whose bin folder has dmxconvert.exe (e.g. Left 4 Dead 2, Team Fortress 2, Source SDK Base 2013), copy a matching dmxconvert.exe next to studiomdl.exe, or re-export the DMX in a current format so no conversion is needed.".to_string()
+    } else {
+        format!("studiomdl looks for {exe} next to studiomdl.exe, in the QC's folder, and on PATH. Put {exe} in the same bin folder as studiomdl.exe.")
+    };
+    Issue { severity: Severity::Error, file: qc.to_path_buf(), line: 0, message, suggestion }
 }
 
 /// Turn studiomdl output into a short list of issues.
 pub fn analyze_output(lines: &[String], qc: &Path) -> Vec<Issue> {
     let mut out: Vec<Issue> = Vec::new();
+    let exec_failures = find_exec_failures(lines);
+    let dmxconvert_failed = exec_failures.iter().any(|f| f.tool.eq_ignore_ascii_case("dmxconvert"));
     for (i, line) in lines.iter().enumerate() {
+        if let Some(f) = exec_failures.iter().find(|f| f.at == i) {
+            out.push(exec_failure_issue(f, qc));
+            continue;
+        }
+        if exec_failures.iter().any(|f| f.reason_at == Some(i)) {
+            continue;
+        }
         let l = line.trim();
+        let lower = l.to_ascii_lowercase();
+        if let Some(b) = BENIGN.iter().find(|b| rule_hit(b, &lower)) {
+            let message = l.trim_start_matches("ERROR:").trim_start_matches("WARNING:").trim();
+            out.push(Issue { severity: Severity::Info, file: qc.to_path_buf(), line: 0, message: format!("{}: {message}", b.short), suggestion: b.fix.into() });
+            continue;
+        }
         let upper = l.to_ascii_uppercase();
         let sev = if upper.contains("ERROR") {
             Severity::Error
@@ -171,7 +256,15 @@ pub fn analyze_output(lines: &[String], qc: &Path) -> Vec<Issue> {
                 message.push_str(n.trim());
             }
         }
-        let (short, fix) = suggest(l).map(|(s, f)| (s.to_string(), f.to_string())).unwrap_or_else(|| (String::new(), "Read the full message in the log; studiomdl stops at the first fatal error, so fix this one and compile again.".into()));
+        let dmx_not_converted = dmxconvert_failed && lower.contains("could not load file") && lower.contains(".dmx");
+        let (short, fix) = if dmx_not_converted {
+            (
+                "DMX could not be converted (dmxconvert.exe failed), so it could not be loaded".to_string(),
+                "The DMX file is probably fine: it is in an older format and studiomdl could not run dmxconvert.exe to upgrade it. Fix the dmxconvert error above.".to_string(),
+            )
+        } else {
+            suggest(l).map(|(s, f)| (s.to_string(), f.to_string())).unwrap_or_else(|| (String::new(), "Read the full message in the log; studiomdl stops at the first fatal error, so fix this one and compile again.".into()))
+        };
         let message = if short.is_empty() { message } else { format!("{short}: {message}") };
         if out.iter().any(|o| o.message == message && o.line == ln) {
             continue;
@@ -235,4 +328,61 @@ pub fn make_temp_game(dir: &Path, fs: Option<&crate::gamefs::GameFs>) -> std::io
         "\"GameInfo\"\n{{\n\tgame \"Golden Stunstick verify\"\n\ttype multiplayer_only\n\tFileSystem\n\t{{\n\t\tSteamAppId 243750\n\t\tSearchPaths\n\t\t{{\n\t\t\tgame+mod+mod_write+game_write+default_write_path |gameinfo_path|.\n{paths}\t\t}}\n\t}}\n}}\n"
     );
     std::fs::write(dir.join("gameinfo.txt"), text)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Real Left 4 Dead studiomdl output: an old-format DMX needs dmxconvert.exe, which that branch lacks.
+    const MISSING_DMXCONVERT: &str = r#"WARNING: AppFramework : Unable to load module p4lib.dll!
+qdir:    "d:\models\john_xsi\"
+Working on "Male_07.qc"
+converting file d:\models\john_xsi\dmx\male_07_high.dmx from model 1 to model 7
+WARNING: Could not execute the command:
+   dmxconvert -allowdebug -i d:\models\john_xsi\dmx\male_07_high.dmx -o d:\models\john_xsi\dmx\_temp_conversion_file_.dmx -oe binary -of model
+Windows gave the error message:
+   "The system cannot find the file specified."
+ERROR: d:\models\john_xsi\Male_07.qc(304): - could not load file 'dmx\male_07_high.dmx'
+ERROR: Aborted Processing on 'player/john/john_freeman.mdl'
+WARNING: Leaking 1 elements"#;
+
+    #[test]
+    fn missing_dmxconvert_is_explained() {
+        let lines: Vec<String> = MISSING_DMXCONVERT.lines().map(String::from).collect();
+        let issues = analyze_output(&lines, Path::new(r"d:\models\john_xsi\Male_07.qc"));
+        for i in &issues {
+            println!("{:?} {}:{} {}", i.severity, i.file.display(), i.line, i.message);
+        }
+        assert_eq!(issues.len(), 4, "p4lib info, dmxconvert error, dmx load error, leak info");
+
+        assert_eq!(issues[0].severity, Severity::Info);
+        assert!(issues[0].message.contains("Perforce"));
+        assert!(!issues[0].message.contains("Frame number"));
+
+        assert_eq!(issues[1].severity, Severity::Error);
+        assert_eq!(issues[1].message, "studiomdl could not find dmxconvert.exe: The system cannot find the file specified.");
+        assert!(issues[1].suggestion.contains("dmxconvert.exe"));
+
+        assert_eq!(issues[2].severity, Severity::Error);
+        assert_eq!(issues[2].line, 304);
+        assert!(issues[2].message.starts_with("DMX could not be converted"));
+
+        assert_eq!(issues[3].severity, Severity::Info);
+        assert!(issues[3].message.contains("Leaking 1 elements"));
+    }
+
+    #[test]
+    fn frame_rule_needs_both_words() {
+        assert!(suggest("WARNING: AppFramework : Unable to load module foo.dll!").is_none());
+        assert_eq!(suggest("ERROR: event frame 40 out of range").map(|s| s.0), Some("Frame number out of range"));
+    }
+
+    #[test]
+    fn plain_missing_file_keeps_generic_advice() {
+        let lines = vec!["ERROR: c:\\m\\a.qc(3): - could not load file 'body.smd'".to_string()];
+        let issues = analyze_output(&lines, Path::new(r"c:\m\a.qc"));
+        assert_eq!(issues.len(), 1);
+        assert!(issues[0].message.starts_with("A file referenced by the QC could not be opened"));
+    }
 }

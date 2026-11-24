@@ -1,14 +1,20 @@
+> [!WARNING]
+> This program was and is being assited with AI, but is created specifically for me.
+> You are free to use this and to modify its code without asking for permission.
+
 # Golden Stunstick
 
 <img src="assets/Stunstick_Icon.png" width="96" align="right" alt="Golden Stunstick icon">
 
 A Source engine modding workbench in a single Windows EXE:
 
-- **Animator** – frame-by-frame / pose-by-pose animation of any QC's skeleton, with an
-  automatic "easy rig" (IK for arms and legs), keyframe easing, smoothing and crossfades,
-  saved to your session and exported as **SMD** or **DMX** (both verified to compile with studiomdl).
+- **Animator** – frame-by-frame / pose-by-pose animation of any QC's skeleton, with Move/Rotate
+  gizmos, a free-fly camera, an automatic "easy rig" (IK for arms and legs), keyframe easing,
+  smoothing and crossfades, SMD animation import, saved to your session and exported as **SMD**
+  or **DMX** (both verified to compile with studiomdl).
 - **Model Viewer** – an HLMV-style viewer for every model in the game your session mounts,
-  with filters by name / folder / VPK, sequences and blends, bodygroups, skins, LODs, TF2 paints,
+  with filters by name / folder / VPK, sequences, blends and pose parameters, animation event
+  sounds (footsteps etc.), bodygroups, skins, LODs, TF2 paints,
   flexes, bones, attachments, hitboxes, physics, bonemerge and a material/VPK report.
 - **Compiler & Decompiler** – a Crowbar-style front end for `studiomdl.exe` with QC pre-checks,
   short error summaries, suggested fixes and `compileerror_<date>.txt` logs, plus a decompiler that
@@ -105,7 +111,9 @@ New Session fills it in automatically when it can find it.
 | `--model <models/...mdl>` | open a model from the mounted game in the Model Viewer |
 | `--seq <name>` | sequence to play for `--model` |
 | `--qc <file.qc>` | open a QC in the Animator (`--easy-rig` also builds the IK rig) |
+| `--bone <name>` / `--tool move\|rotate` | with `--qc`: select a bone / pick the posing tool |
 | `--viewer-page <name>` | Model Viewer panel: `render`, `sequence`, `body`, `flexes`, `bones`, `attachments`, `hitboxes`, `physics`, `bonemerge`, `materials`, `info` |
+| `--no-sound` | start the Model Viewer with event sounds off |
 | `--open-session-list` | show the Open Session list on start |
 
 ---
@@ -152,7 +160,8 @@ src/
   decompile.rs       MDL -> QC/SMD/VTA/VRD
   verify.rs          decompile self-check and recompile comparison
   compile.rs         studiomdl runner, error analysis, error logs
-  anim.rs            Animator rig, animation document, IK, TXT/SMD/DMX
+  anim.rs            Animator rig, animation document, IK, TXT/SMD/DMX, SMD import
+  sound.rs           soundscripts, WAV/MP3 decoding, animation event sounds, playback
 build.rs             PNG -> ICO, embeds the EXE icon
 tests/               integration tests against a real TF2 install
 ```

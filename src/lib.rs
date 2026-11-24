@@ -8,4 +8,5 @@ pub mod formats;
 pub mod gamefs;
 pub mod render;
 pub mod scene;
+pub mod sound;
 pub mod verify;

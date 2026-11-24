@@ -8,7 +8,7 @@
 //!    sequences, per-frame animation data, physics...).
 
 use crate::decompile::{self, DecompileReport};
-use crate::formats::mdl::{Mdl, STUDIO_DELTA, Vtx, Vvd};
+use crate::formats::mdl::{Mdl, STUDIO_DELTA, STUDIO_FRAMEANIM, Vtx, Vvd};
 use crate::formats::phy::Phy;
 use crate::formats::smd::Smd;
 use glam::{Quat, Vec3};
@@ -135,10 +135,49 @@ fn tol_vec(a: Vec3, b: Vec3, t: f32) -> bool {
     (a - b).length() <= t
 }
 
+/// Root bones moved by the animation's extracted movement (piecewise root motion), the
+/// same transform the decompiler applies when it writes SMD frames.
+fn with_root_motion(m: &Mdl, ai: usize, frame: i32, mut pose: Vec<(Vec3, Quat)>) -> Vec<(Vec3, Quat)> {
+    let ad = &m.anims[ai];
+    if ad.flags & STUDIO_DELTA != 0 || ad.movements.is_empty() {
+        return pose;
+    }
+    let (mp, yaw) = m.movement_at(ai, frame as f32);
+    let mq = Quat::from_rotation_z(yaw.to_radians());
+    for (i, b) in m.bones.iter().enumerate() {
+        if b.parent < 0 {
+            pose[i] = (mq * pose[i].0 + mp, (mq * pose[i].1).normalize());
+        }
+    }
+    pose
+}
+
+/// "66.2 units forward" style summary of a movement piece's cumulative position/yaw.
+fn fmt_move(p: Vec3, yaw: f32) -> String {
+    let mut s = format!("{:.2} units", p.length());
+    if yaw.abs() > 0.05 {
+        s.push_str(&format!(", yaw {yaw:.1} deg"));
+    }
+    s
+}
+
 /// Compare an original model with one recompiled from the decompiled QC.
 #[allow(clippy::too_many_arguments)]
 pub fn compare_models(a: &Mdl, a_ani: Option<&[u8]>, b: &Mdl, b_ani: Option<&[u8]>, a_vtx: Option<&Vtx>, b_vtx: Option<&Vtx>, a_vvd: Option<&Vvd>, b_vvd: Option<&Vvd>, a_phy: Option<&Phy>, b_phy: Option<&Phy>) -> Vec<Check> {
     let mut out = Vec::new();
+    // ---- file format: a studiomdl from a newer engine branch (L4D2, CS:GO...) writes version 49+,
+    // which version-48 games cannot load. Older originals (44-47) recompiled as 48 are fine.
+    if b.version > a.version.max(48) {
+        check(
+            &mut out,
+            "MDL version",
+            false,
+            format!(
+                "The original is MDL version {} but this studiomdl wrote version {}. A game that loads version {} models (Source SDK 2013, TF2, HL2, ...) cannot load the recompiled model. Use the studiomdl.exe from the same engine branch as the game, e.g. Source SDK Base 2013's bin folder.",
+                a.version, b.version, a.version
+            ),
+        );
+    }
     // ---- bones
     let mut diffs = Vec::new();
     if a.bones.len() != b.bones.len() {
@@ -367,6 +406,8 @@ pub fn compare_models(a: &Mdl, a_ani: Option<&[u8]>, b: &Mdl, b_ani: Option<&[u8
     let mut worst_p_at = String::new();
     let mut loop_notes: Vec<String> = Vec::new();
     let mut loop_frame_diffs: Vec<String> = Vec::new();
+    let mut split_notes: Vec<String> = Vec::new();
+    let mut frameanim_skipped: Vec<String> = Vec::new();
     let mut worst_r_at = String::new();
     let mut compared = 0usize;
     let mut done = std::collections::HashSet::new();
@@ -385,6 +426,11 @@ pub fn compare_models(a: &Mdl, a_ani: Option<&[u8]>, b: &Mdl, b_ani: Option<&[u8
             if (da.fps - db.fps).abs() > 1e-3 {
                 diffs.push(format!("'{}' fps {} vs {}", da.name, da.fps, db.fps));
             }
+            if (da.flags & STUDIO_FRAMEANIM) != (db.flags & STUDIO_FRAMEANIM) {
+                // the frames cannot be decoded side by side, so comparing them would only report noise
+                frameanim_skipped.push(da.name.clone());
+                continue;
+            }
             if (da.flags & STUDIO_DELTA) != (db.flags & STUDIO_DELTA) {
                 diffs.push(format!("'{}' delta flag differs", da.name));
             }
@@ -400,8 +446,12 @@ pub fn compare_models(a: &Mdl, a_ani: Option<&[u8]>, b: &Mdl, b_ani: Option<&[u8
                 diffs.push(format!("'{}' {} vs {} movement pieces", da.name, da.movements.len(), db.movements.len()));
             } else {
                 for (m, n) in da.movements.iter().zip(&db.movements) {
-                    if m.endframe != n.endframe || !tol_vec(m.position, n.position, 0.05) || (m.angle - n.angle).abs() > 0.05 {
-                        diffs.push(format!("'{}' root motion differs (end {} pos {:?} vs end {} pos {:?})", da.name, m.endframe, m.position, n.endframe, n.position));
+                    if m.endframe != n.endframe || m.motionflags != n.motionflags {
+                        diffs.push(format!("'{}' movement piece ends at frame {} ({}) vs {} ({})", da.name, m.endframe, decompile::motion_flags(m.motionflags), n.endframe, decompile::motion_flags(n.motionflags)));
+                    } else if !tol_vec(m.position, n.position, 0.05) || (m.angle - n.angle).abs() > 0.05 {
+                        // Same pieces, different distances. The per-frame comparison below runs in
+                        // world space, so it still fails if the animation itself moves differently.
+                        split_notes.push(format!("{} frame {}: {} vs {}", da.name, m.endframe, fmt_move(m.position, m.angle), fmt_move(n.position, n.angle)));
                     }
                 }
             }
@@ -416,8 +466,10 @@ pub fn compare_models(a: &Mdl, a_ani: Option<&[u8]>, b: &Mdl, b_ani: Option<&[u8
                 frames.push(da.numframes - 1);
             }
             for f in frames {
-                let pa = a.decode_frame(ia, f, a_ani);
-                let pb = b.decode_frame(ib, f, b_ani);
+                // root bones are compared in world space (local + extracted movement): compilers
+                // may split the same motion differently between the bone and the movement track
+                let pa = with_root_motion(a, ia, f, a.decode_frame(ia, f, a_ani));
+                let pb = with_root_motion(b, ib, f, b.decode_frame(ib, f, b_ani));
                 let loop_fixup_frame = da.flags & 1 != 0 && f == da.numframes - 1 && da.numframes > 1;
                 for (bi, m) in bone_map.iter().enumerate() {
                     let Some(m) = m else { continue };
@@ -441,6 +493,13 @@ pub fn compare_models(a: &Mdl, a_ani: Option<&[u8]>, b: &Mdl, b_ani: Option<&[u8
             }
         }
     }
+    if !frameanim_skipped.is_empty() {
+        diffs.push(format!(
+            "{} animation(s) were not compared because one model stores them in the frame-anim encoding (written by newer-branch studiomdl builds such as Left 4 Dead 2 / CS:GO, not loadable by Source SDK 2013 games): {}",
+            frameanim_skipped.len(),
+            summarize(&frameanim_skipped)
+        ));
+    }
     let anim_ok = diffs.is_empty() && worst_p < 0.1 && worst_r < 1.0;
     let mut notes = String::new();
     if !loop_notes.is_empty() {
@@ -452,6 +511,13 @@ pub fn compare_models(a: &Mdl, a_ani: Option<&[u8]>, b: &Mdl, b_ani: Option<&[u8
     }
     if !loop_frame_diffs.is_empty() {
         notes.push_str(&format!(". Note: studiomdl's loop fix-up changed the last frame of: {}", summarize(&loop_frame_diffs)));
+    }
+    if !split_notes.is_empty() {
+        notes.push_str(&format!(
+            ". Note: {} movement piece(s) split the same root motion differently (the animation looks identical, but the entity's movement distance differs; this studiomdl always measures a piece from its start frame to its end frame, the original compiler did not): {}",
+            split_notes.len(),
+            summarize(&split_notes)
+        ));
     }
     check(
         &mut out,

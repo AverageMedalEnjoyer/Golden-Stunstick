@@ -34,6 +34,63 @@ pub struct Rig {
     pub meshes: Vec<RigMesh>,
     pub cdmaterials: Vec<String>,
     pub warnings: Vec<String>,
+    /// the QC's `eyeball` lines, for drawing the iris
+    pub eyeballs: Vec<RigEyeball>,
+}
+
+/// A QC `eyeball`: the eye's centre and axes in its bone's frame.
+#[derive(Clone, Debug)]
+pub struct RigEyeball {
+    /// material of the eyeball mesh (SMD triangle material, without extension)
+    pub material: String,
+    pub bone: usize,
+    pub org: Vec3,
+    pub forward: Vec3,
+    pub up: Vec3,
+    /// 1 / iris size in units (as studiomdl stores it)
+    pub iris_scale: f32,
+    pub radius: f32,
+}
+
+/// Read the `eyeball` lines inside the QC's `$model` blocks:
+/// `eyeball <name> <bone> <x> <y> <z> <material> <diameter> <angle> <iris material> <iris size>`.
+/// The position is in model space; studiomdl takes the eye to look along the model's forward
+/// axis, which this works out from where the eyes sit relative to their bone (in front of it).
+fn qc_eyeballs(q: &Qc, bones: &[SmdNode], bind: &[(Vec3, Quat)]) -> Vec<RigEyeball> {
+    let world = world_of(bones, bind);
+    let mut raw: Vec<(String, usize, Vec3, f32, f32)> = Vec::new();
+    for c in q.all("$model") {
+        let a = &c.args;
+        let mut i = 0;
+        while i < a.len() {
+            if !a[i].quoted && a[i].text.eq_ignore_ascii_case("eyeball") && i + 10 < a.len() {
+                let num = |k: usize| a[i + k].text.parse::<f32>().ok();
+                let bone = bones.iter().position(|b| b.name.eq_ignore_ascii_case(&a[i + 2].text));
+                if let (Some(bone), Some(x), Some(y), Some(z), Some(d), Some(iris)) = (bone, num(3), num(4), num(5), num(7), num(10)) {
+                    let mat = a[i + 6].text.trim_end_matches(".vmt").to_string();
+                    raw.push((mat, bone, Vec3::new(x, y, z), d * 0.5, if iris.abs() > 1e-6 { 1.0 / iris } else { 0.0 }));
+                }
+                i += 11;
+            } else {
+                i += 1;
+            }
+        }
+    }
+    if raw.is_empty() {
+        return Vec::new();
+    }
+    // forward: horizontal direction from the eyes' bone (head) to the middle of the eyes
+    let mid = raw.iter().map(|r| r.2).sum::<Vec3>() / raw.len() as f32;
+    let head = Vec3::from(world[raw[0].1].translation);
+    let mut fwd = mid - head;
+    fwd.z = 0.0;
+    let forward = if fwd.length() > 1e-3 { fwd.normalize() } else { -Vec3::Y };
+    raw.into_iter()
+        .map(|(material, bone, pos, radius, iris_scale)| {
+            let inv = world[bone].inverse();
+            RigEyeball { material, bone, org: inv.transform_point3(pos), forward: inv.transform_vector3(forward), up: inv.transform_vector3(Vec3::Z), iris_scale, radius }
+        })
+        .collect()
 }
 
 /// Load an SMD or DMX (binary or text) as SMD data.
@@ -122,7 +179,8 @@ impl Rig {
             })
             .collect();
         let qc_name = qc_path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "model".into());
-        Ok(Rig { qc_path: qc_path.to_path_buf(), qc_name, bones, bind, meshes, cdmaterials: q.cdmaterials(), warnings })
+        let eyeballs = qc_eyeballs(&q, &bones, &bind);
+        Ok(Rig { qc_path: qc_path.to_path_buf(), qc_name, bones, bind, meshes, cdmaterials: q.cdmaterials(), warnings, eyeballs })
     }
 
     pub fn world(&self, pose: &[(Vec3, Quat)]) -> Vec<Affine3A> {
@@ -282,11 +340,23 @@ fn limb_setup(rig: &Rig, ia: usize, ib: usize, ic: usize) -> LimbSetup {
     }
 }
 
+/// The natural bend direction (unit, perpendicular to `dir`) of a limb aimed along `dir`:
+/// the reference pose's pole, following the body (clavicle / pelvis). `None` when `dir`
+/// points straight along the pole.
+fn natural_bend(rig: &Rig, w: &[Affine3A], setup: &LimbSetup, ia: usize, dir: Vec3) -> Option<Vec3> {
+    let pa = rig.bones[ia].parent;
+    let root_rot = if pa >= 0 { rot_of(&w[pa as usize]) } else { Quat::IDENTITY };
+    let pole = root_rot * setup.pole;
+    let p = pole - dir * pole.dot(dir);
+    (p.length() > 1e-4).then(|| p.normalize())
+}
+
 /// Easy-rig IK (like Source Filmmaker's): an analytic two-bone solve on the last three bones
 /// of `chain` (upper arm / forearm / hand, or thigh / calf / foot). The shoulder or hip stays
 /// put, the hand/foot goes exactly to `target` (clamped to the limb's reach) and keeps its
-/// world rotation, and the elbow/knee bends in the plane given by the reference pose, so it
-/// always points the natural way (elbows back, knees forward) with no twisting.
+/// world rotation. The elbow/knee bends the natural way (elbows back, knees forward, from the
+/// reference pose) turned by however far it is currently swung from that (see [`swing_limb`]),
+/// so a knee the animator pointed outwards stays pointed outwards while the foot moves.
 pub fn solve_ik(rig: &Rig, pose: &mut [(Vec3, Quat)], chain: &[usize], target: Vec3) {
     let n = chain.len();
     if n < 3 {
@@ -294,6 +364,54 @@ pub fn solve_ik(rig: &Rig, pose: &mut [(Vec3, Quat)], chain: &[usize], target: V
     }
     let (ia, ib, ic) = (chain[n - 3], chain[n - 2], chain[n - 1]);
     let setup = limb_setup(rig, ia, ib, ic);
+    let w = rig.world(pose);
+    let (a, b, c) = (Vec3::from(w[ia].translation), Vec3::from(w[ib].translation), Vec3::from(w[ic].translation));
+    // current swing: signed angle from the natural bend to the actual one, about the limb axis
+    let cur_dir = (c - a).normalize_or(Vec3::Z);
+    let cur_bend = (b - a) - cur_dir * (b - a).dot(cur_dir);
+    let swing = match natural_bend(rig, &w, &setup, ia, cur_dir) {
+        Some(nat) if cur_bend.length() > (b - a).length() * 1e-3 => {
+            let cb = cur_bend.normalize();
+            nat.cross(cb).dot(cur_dir).atan2(nat.dot(cb))
+        }
+        _ => 0.0,
+    };
+    let to_t = target - a;
+    let dir = if to_t.length() > 1e-5 { to_t.normalize() } else { cur_dir };
+    let bend = match natural_bend(rig, &w, &setup, ia, dir) {
+        Some(nat) => Quat::from_axis_angle(dir, swing) * nat,
+        // target straight along the pole: keep the current bend side
+        None => {
+            let p = (b - a) - dir * (b - a).dot(dir);
+            if p.length() > 1e-4 { p.normalize() } else { any_perpendicular(dir) }
+        }
+    };
+    solve_two_bone(rig, pose, &setup, (ia, ib, ic), target, bend);
+}
+
+/// Easy-rig elbow/knee control (Source Filmmaker's pole vector): swing the elbow/knee of
+/// `chain` towards `pole_target` around the shoulder-to-hand (hip-to-foot) line, keeping the
+/// hand/foot exactly where it is.
+pub fn swing_limb(rig: &Rig, pose: &mut [(Vec3, Quat)], chain: &[usize], pole_target: Vec3) {
+    let n = chain.len();
+    if n < 3 {
+        return;
+    }
+    let (ia, ib, ic) = (chain[n - 3], chain[n - 2], chain[n - 1]);
+    let setup = limb_setup(rig, ia, ib, ic);
+    let w = rig.world(pose);
+    let (a, c) = (Vec3::from(w[ia].translation), Vec3::from(w[ic].translation));
+    let dir = (c - a).normalize_or(Vec3::Z);
+    let p = (pole_target - a) - dir * (pole_target - a).dot(dir);
+    if p.length() < 1e-4 {
+        return;
+    }
+    solve_two_bone(rig, pose, &setup, (ia, ib, ic), c, p.normalize());
+}
+
+/// Two-bone solve: put the end of `ic` at `target` with the middle joint bending towards
+/// `bend` (unit, perpendicular to the root-to-target line); the end bone keeps its world rotation.
+fn solve_two_bone(rig: &Rig, pose: &mut [(Vec3, Quat)], setup: &LimbSetup, (ia, ib, ic): (usize, usize, usize), target: Vec3, bend: Vec3) {
     let w = rig.world(pose);
     let eff_rot = rot_of(&w[ic]);
     let (a, b, c) = (Vec3::from(w[ia].translation), Vec3::from(w[ib].translation), Vec3::from(w[ic].translation));
@@ -304,19 +422,7 @@ pub fn solve_ik(rig: &Rig, pose: &mut [(Vec3, Quat)], chain: &[usize], target: V
     let to_t = target - a;
     let dir = if to_t.length() > 1e-5 { to_t.normalize() } else { (c - a).normalize_or(Vec3::Z) };
     let dist = to_t.length().clamp((l1 - l2).abs() + 1e-3, (l1 + l2) * 0.9999);
-    // where the elbow/knee points, following the body (clavicle / pelvis)
-    let pa = rig.bones[ia].parent;
-    let root_rot = if pa >= 0 { rot_of(&w[pa as usize]) } else { Quat::IDENTITY };
-    let pole = root_rot * setup.pole;
-    let mut p = pole - dir * pole.dot(dir);
-    if p.length() < 1e-4 {
-        // target straight along the pole: keep the current bend side
-        p = (b - a) - dir * (b - a).dot(dir);
-        if p.length() < 1e-4 {
-            p = any_perpendicular(dir);
-        }
-    }
-    let p = p.normalize();
+    let p = (bend - dir * bend.dot(dir)).normalize_or(any_perpendicular(dir));
     let x = (l1 * l1 - l2 * l2 + dist * dist) / (2.0 * dist);
     let y = (l1 * l1 - x * x).max(0.0).sqrt();
     let elbow = a + dir * x + p * y;
@@ -716,6 +822,420 @@ impl AnimDoc {
     }
 }
 
+// ---------------------------------------------------------------------------
+// SMD animation import
+// ---------------------------------------------------------------------------
+
+/// How an SMD animation's skeleton maps onto a rig.
+pub struct SmdMatch {
+    /// rig bone -> SMD node
+    pub map: Vec<Option<usize>>,
+    /// rig bones whose parent differs from the SMD's (converted through world space)
+    pub reparented: Vec<bool>,
+    /// the SMD comes from a skeleton with other bone lengths: use the rig's own bone
+    /// lengths (rotations only) and scale the root motion
+    pub other_proportions: bool,
+    pub root_scale: f32,
+    /// human-readable differences (empty when the skeletons match)
+    pub diffs: Vec<String>,
+}
+
+fn name_list(v: &[String]) -> String {
+    let mut s = v.iter().take(12).map(|n| format!("'{n}'")).collect::<Vec<_>>().join(", ");
+    if v.len() > 12 {
+        let _ = write!(s, " and {} more", v.len() - 12);
+    }
+    s
+}
+
+/// Compare an SMD's skeleton with the rig (bones are matched by name, ignoring case).
+pub fn match_smd(smd: &Smd, rig: &Rig) -> SmdMatch {
+    let find = |name: &str| smd.nodes.iter().position(|n| n.name.eq_ignore_ascii_case(name));
+    let map: Vec<Option<usize>> = rig.bones.iter().map(|b| find(&b.name)).collect();
+    let smd_parent = |i: usize| -> String { smd.nodes[i].parent.try_into().ok().and_then(|p: usize| smd.nodes.get(p)).map(|n| n.name.clone()).unwrap_or_default() };
+    let rig_parent = |r: usize| -> String { rig.bones[r].parent.try_into().ok().and_then(|p: usize| rig.bones.get(p)).map(|n| n.name.clone()).unwrap_or_default() };
+    let reparented: Vec<bool> = (0..rig.bones.len()).map(|r| map[r].map(|i| !smd_parent(i).eq_ignore_ascii_case(&rig_parent(r))).unwrap_or(false)).collect();
+    let mut diffs = Vec::new();
+    let missing: Vec<String> = (0..rig.bones.len()).filter(|&r| map[r].is_none()).map(|r| rig.bones[r].name.clone()).collect();
+    let extra: Vec<String> = smd.nodes.iter().filter(|n| !rig.bones.iter().any(|b| b.name.eq_ignore_ascii_case(&n.name))).map(|n| n.name.clone()).collect();
+    if map.iter().all(|m| m.is_none()) {
+        diffs.push("None of the SMD's bones exist in this model.".into());
+    }
+    if !missing.is_empty() {
+        diffs.push(format!("{} bone(s) of the model are not in the SMD; they keep the model's reference pose: {}", missing.len(), name_list(&missing)));
+    }
+    if !extra.is_empty() {
+        diffs.push(format!("{} bone(s) in the SMD are not in the model and are ignored: {}", extra.len(), name_list(&extra)));
+    }
+    for r in (0..rig.bones.len()).filter(|&r| reparented[r]) {
+        let i = map[r].unwrap_or(0);
+        diffs.push(format!("'{}' has parent '{}' in the SMD but '{}' in the model; its world position is kept", rig.bones[r].name, smd_parent(i), rig_parent(r)));
+    }
+    // bone lengths (first frame vs. the reference pose); animated translations are rare, so
+    // a different length on many bones means a differently proportioned skeleton
+    let mut ratios = Vec::new();
+    let mut differing = 0;
+    let mut measured = 0;
+    if let Some(f0) = smd.frames.first() {
+        for r in 0..rig.bones.len() {
+            let (Some(i), true) = (map[r], rig.bones[r].parent >= 0) else { continue };
+            let bind_len = rig.bind[r].0.length();
+            let Some(&(p, _)) = f0.get(i) else { continue };
+            if bind_len < 0.5 || reparented[r] {
+                continue;
+            }
+            measured += 1;
+            let ratio = p.length() / bind_len;
+            ratios.push(ratio);
+            if (ratio - 1.0).abs() > 0.05 {
+                differing += 1;
+            }
+        }
+    }
+    let other_proportions = measured > 0 && differing * 10 > measured * 3;
+    let root_scale = if other_proportions {
+        ratios.sort_by(f32::total_cmp);
+        let median = ratios[ratios.len() / 2];
+        if median > 1e-3 { 1.0 / median } else { 1.0 }
+    } else {
+        1.0
+    };
+    if other_proportions {
+        diffs.push(format!(
+            "{differing} of {measured} bones have different lengths: the SMD comes from a differently proportioned skeleton. Its rotations are used with this model's bone lengths, and root motion is scaled by {root_scale:.2}."
+        ));
+    }
+    SmdMatch { map, reparented, other_proportions, root_scale, diffs }
+}
+
+/// Turn an SMD animation into an animation document for `rig` (one linear key per SMD frame).
+pub fn import_smd(smd: &Smd, rig: &Rig, m: &SmdMatch, fps: f32, looping: bool) -> AnimDoc {
+    let n = rig.bones.len();
+    let mut keys = BTreeMap::new();
+    for (f, frame) in smd.frames.iter().enumerate() {
+        // the SMD's local pose, adjusted to the rig's proportions if needed
+        let mut local: Vec<(Vec3, Quat)> = smd.nodes.iter().enumerate().map(|(i, _)| frame.get(i).map(|(p, r)| (*p, euler_to_quat(*r))).unwrap_or((Vec3::ZERO, Quat::IDENTITY))).collect();
+        if m.other_proportions {
+            for r in 0..n {
+                if let Some(i) = m.map[r] {
+                    if smd.nodes[i].parent >= 0 {
+                        if !m.reparented[r] {
+                            local[i].0 = rig.bind[r].0;
+                        }
+                    } else {
+                        local[i].0 *= m.root_scale;
+                    }
+                }
+            }
+        }
+        let smd_world = world_of(&smd.nodes, &local);
+        let mut pose: Vec<(Vec3, Quat)> = Vec::with_capacity(n);
+        let mut rig_world: Vec<Affine3A> = Vec::with_capacity(n);
+        for r in 0..n {
+            let parent = rig.bones[r].parent;
+            let parent_world = if parent >= 0 && (parent as usize) < rig_world.len() { rig_world[parent as usize] } else { Affine3A::IDENTITY };
+            let l = match m.map[r] {
+                Some(i) if !m.reparented[r] => local[i],
+                Some(i) => {
+                    // different parent: keep the bone where the SMD puts it in the world
+                    let (_, q, p) = (parent_world.inverse() * smd_world[i]).to_scale_rotation_translation();
+                    (if m.other_proportions && parent >= 0 { rig.bind[r].0 } else { p }, q.normalize())
+                }
+                None => rig.bind[r],
+            };
+            rig_world.push(parent_world * Affine3A::from_rotation_translation(l.1, l.0));
+            pose.push(l);
+        }
+        keys.insert(f as u32, Keyframe { pose, ease: Ease::Linear });
+    }
+    if keys.is_empty() {
+        keys.insert(0, Keyframe { pose: rig.bind.clone(), ease: Ease::Linear });
+    }
+    AnimDoc { name: None, qc_path: rig.qc_path.clone(), fps: fps.max(1.0), frames: (smd.frames.len() as u32).max(1), looping, smoothing: 0.0, bones: rig.bone_signature(), keys }
+}
+
+/// Largest local rotation (degrees) a key-reduced animation may differ from the source by.
+pub const REDUCE_ROT_TOL_DEG: f32 = 0.5;
+/// Largest bone position error (units, world space) a key-reduced animation may have.
+pub const REDUCE_POS_TOL: f32 = 0.05;
+
+/// Source poses for [`reduce_keys`] and the error of interpolating between chosen keys.
+struct Reducer<'a> {
+    rig: &'a Rig,
+    frames: Vec<u32>,
+    poses: Vec<Vec<(Vec3, Quat)>>,
+    worlds: Vec<Vec<Vec3>>,
+}
+
+/// (error, worst source index, ease) of one segment; error <= 1 means within tolerance.
+type SegFit = (f32, usize, Ease);
+
+impl Reducer<'_> {
+    /// Pose at source index `i` of the segment `a`..`b` (spline neighbours `prev` / `next`),
+    /// exactly as [`AnimDoc::sample`] interpolates it (smoothing 0).
+    fn interp_at(&self, prev: usize, a: usize, b: usize, next: usize, ease: Ease, i: usize) -> Vec<(Vec3, Quat)> {
+        let t = (self.frames[i] - self.frames[a]) as f32 / (self.frames[b] - self.frames[a]).max(1) as f32;
+        let (pa, pb) = (&self.poses[a], &self.poses[b]);
+        if ease == Ease::Spline {
+            let (pp, pn) = (&self.poses[prev], &self.poses[next]);
+            return (0..pa.len()).map(|j| (catmull(pp[j].0, pa[j].0, pb[j].0, pn[j].0, t), quat_catmull(pp[j].1, pa[j].1, pb[j].1, pn[j].1, t))).collect();
+        }
+        let e = ease.apply(t);
+        pa.iter().zip(pb).map(|(x, y)| (x.0.lerp(y.0, e), x.1.slerp(y.1, e).normalize())).collect()
+    }
+
+    /// Error of an interpolated pose against source index `i` (<= 1 is within tolerance).
+    fn pose_error(&self, p: &[(Vec3, Quat)], i: usize) -> f32 {
+        let mut err = 0.0f32;
+        for (x, y) in p.iter().zip(&self.poses[i]) {
+            err = err.max((x.1.dot(y.1).abs().min(1.0).acos() * 2.0).to_degrees() / REDUCE_ROT_TOL_DEG);
+        }
+        if err > 1.0 {
+            return err;
+        }
+        for (w, y) in self.rig.world(p).iter().zip(&self.worlds[i]) {
+            err = err.max(Vec3::from(w.translation).distance(*y) / REDUCE_POS_TOL);
+        }
+        err
+    }
+
+    /// Does segment `a`..`b` reproduce every source frame in between with `ease`?
+    fn fits(&self, prev: usize, a: usize, b: usize, next: usize, ease: Ease) -> bool {
+        // test the middle first: it fails most often
+        let mid = (a + b) / 2;
+        (a + 1..b).filter(|&i| i != mid).chain((b > a + 1).then_some(mid)).collect::<Vec<_>>().iter().rev().all(|&i| self.pose_error(&self.interp_at(prev, a, b, next, ease, i), i) <= 1.0)
+    }
+
+    fn seg_error(&self, k: &[usize], s: usize, ease: Ease) -> (f32, usize) {
+        let (a, b) = (k[s], k[s + 1]);
+        let prev = if s > 0 { k[s - 1] } else { a };
+        let next = if s + 2 < k.len() { k[s + 2] } else { b };
+        let mut worst = (0.0f32, a);
+        for i in a + 1..b {
+            let err = self.pose_error(&self.interp_at(prev, a, b, next, ease, i), i);
+            if err > worst.0 {
+                worst = (err, i);
+            }
+        }
+        worst
+    }
+
+    /// The ease that reproduces segment `s` best.
+    fn best(&self, k: &[usize], s: usize) -> SegFit {
+        let mut best = (f32::MAX, k[s], Ease::Linear);
+        for ease in [Ease::Spline, Ease::Smooth, Ease::Linear, Ease::EaseIn, Ease::EaseOut, Ease::Hold] {
+            let (err, i) = self.seg_error(k, s, ease);
+            if err < best.0 {
+                best = (err, i, ease);
+            }
+        }
+        best
+    }
+
+    /// Recompute the fits of the segments a change at key position `p` can affect
+    /// (spline segments look one key further each way).
+    fn refresh(&self, k: &[usize], fits: &mut [SegFit], p: usize) {
+        let segs = k.len() - 1;
+        for s in p.saturating_sub(3)..(p + 2).min(segs) {
+            fits[s] = self.best(k, s);
+        }
+    }
+}
+
+/// Pose-to-pose key reduction: keep only the keys needed to reproduce the animation, each
+/// segment getting the ease that fits it (spline / smooth / linear / ease in / ease out / hold).
+/// An animation made pose-to-pose and baked to one key per frame (an exported SMD) comes back
+/// as roughly its original poses. Every frame stays within [`REDUCE_ROT_TOL_DEG`] /
+/// [`REDUCE_POS_TOL`] of the source. Returns the number of keys removed.
+pub fn reduce_keys(doc: &mut AnimDoc, rig: &Rig) -> usize {
+    let frames: Vec<u32> = doc.keys.keys().copied().collect();
+    if frames.len() < 3 || doc.smoothing > 0.0 {
+        return 0;
+    }
+    let n = rig.bones.len();
+    let pad = |p: &[(Vec3, Quat)]| -> Vec<(Vec3, Quat)> { (0..n).map(|i| p.get(i).copied().unwrap_or(rig.bind[i])).collect() };
+    let poses: Vec<Vec<(Vec3, Quat)>> = frames.iter().map(|f| pad(&doc.keys[f].pose)).collect();
+    let worlds = poses.iter().map(|p| rig.world(p).iter().map(|w| Vec3::from(w.translation)).collect()).collect();
+    let r = Reducer { rig, frames, poses, worlds };
+    let last = r.frames.len() - 1;
+    let mut k = if r.frames.len() <= DP_MAX_FRAMES { dp_keys(&r) } else { top_down_keys(&r) };
+    // the pose after the last key holds, so a final key that only holds the previous pose
+    // is not needed (unless the animation loops back to its start from there)
+    while !doc.looping && k.len() > 2 {
+        let p = k[k.len() - 2];
+        if (p + 1..=last).all(|i| r.pose_error(&r.poses[p], i) <= 1.0) {
+            k.pop();
+        } else {
+            break;
+        }
+    }
+    let fits: Vec<SegFit> = (0..k.len() - 1).map(|s| r.best(&k, s)).collect();
+
+    let before = doc.keys.len();
+    let last_ease = doc.keys[&r.frames[*k.last().unwrap()]].ease;
+    let mut keys = BTreeMap::new();
+    for (s, &i) in k.iter().enumerate() {
+        if let Some(mut key) = doc.keys.remove(&r.frames[i]) {
+            key.ease = fits.get(s).map(|f| f.2).unwrap_or(last_ease);
+            keys.insert(r.frames[i], key);
+        }
+    }
+    doc.keys = keys;
+    before - doc.keys.len()
+}
+
+/// Longest animation (in source keys) [`dp_keys`] handles; longer ones (mocap) use the
+/// faster [`top_down_keys`].
+const DP_MAX_FRAMES: usize = 900;
+/// Longest gap between two keys [`dp_keys`] considers.
+const DP_MAX_GAP: usize = 40;
+
+/// Fewest keys that reproduce the source, by dynamic programming over (previous key, key)
+/// pairs - a spline segment depends on the keys either side of it, so keys can't be judged
+/// one at a time. Returns source indices, first and last included.
+fn dp_keys(r: &Reducer) -> Vec<usize> {
+    let last = r.frames.len() - 1;
+    let g = DP_MAX_GAP;
+    let idx = |i: usize, j: usize| j * (g + 1) + (j - i);
+    // state (i, j): the last two keys are i, j and every segment before i..j fits;
+    // value: (number of keys, key before i)
+    let mut st: Vec<Option<(u32, usize)>> = vec![None; (last + 1) * (g + 1)];
+    for j in 1..=g.min(last) {
+        st[idx(0, j)] = Some((2, 0));
+    }
+    let mut simple: std::collections::HashMap<(usize, usize), bool> = std::collections::HashMap::new();
+    let mut valid = |h: usize, i: usize, j: usize, k: usize| -> bool {
+        let ok = *simple.entry((i, j)).or_insert_with(|| [Ease::Smooth, Ease::Linear, Ease::EaseIn, Ease::EaseOut, Ease::Hold].iter().any(|&e| r.fits(i, i, j, j, e)));
+        ok || r.fits(h, i, j, k, Ease::Spline)
+    };
+    let mut end: Option<(u32, usize)> = None;
+    for j in 1..=last {
+        for i in j.saturating_sub(g)..j {
+            let Some((cnt, h)) = st[idx(i, j)] else { continue };
+            if j == last {
+                if end.is_none_or(|(c, _)| cnt < c) && valid(h, i, last, last) {
+                    end = Some((cnt, i));
+                }
+                continue;
+            }
+            for k in j + 1..=(j + g).min(last) {
+                if st[idx(j, k)].is_some_and(|(c, _)| c <= cnt + 1) {
+                    continue;
+                }
+                if valid(h, i, j, k) {
+                    st[idx(j, k)] = Some((cnt + 1, i));
+                }
+            }
+        }
+    }
+    let Some((_, mut i)) = end else { return (0..=last).collect() };
+    let mut j = last;
+    let mut keys = vec![last];
+    loop {
+        keys.push(i);
+        if i == 0 {
+            break;
+        }
+        let Some((_, h)) = st[idx(i, j)] else { return (0..=last).collect() };
+        j = i;
+        i = h;
+    }
+    keys.reverse();
+    keys
+}
+
+/// Key reduction for long animations: start with the ends, add a key where the fit is worst
+/// until everything fits, then drop / slide keys that are not needed.
+fn top_down_keys(r: &Reducer) -> Vec<usize> {
+    let last = r.frames.len() - 1;
+    let mut k = vec![0, last];
+    let mut fits = vec![r.best(&k, 0)];
+    loop {
+        let (s, &(err, worst, _)) = fits.iter().enumerate().max_by(|a, b| a.1.0.total_cmp(&b.1.0)).unwrap();
+        if err <= 1.0 || worst <= k[s] || worst >= k[s + 1] {
+            break;
+        }
+        k.insert(s + 1, worst);
+        fits.insert(s + 1, (0.0, 0, Ease::Linear));
+        r.refresh(&k, &mut fits, s + 1);
+    }
+    // then alternately drop every key the others can do without and slide keys to where they
+    // leave the most slack (insertion picks worst-error frames, not the animator's poses)
+    for _round in 0..8 {
+        let mut changed = false;
+        let mut p = 1;
+        while p + 1 < k.len() {
+            let mut trial = k.clone();
+            trial.remove(p);
+            let mut tf = fits.clone();
+            tf.remove(p);
+            r.refresh(&trial, &mut tf, p);
+            if tf.iter().all(|f| f.0 <= 1.0) {
+                k = trial;
+                fits = tf;
+                changed = true;
+                continue;
+            }
+            p += 1;
+        }
+        let local = |f: &[SegFit], p: usize| -> f32 { f[p.saturating_sub(3)..(p + 2).min(f.len())].iter().map(|x| x.0).sum() };
+        for p in 1..k.len().saturating_sub(1) {
+            let (lo, hi) = (k[p - 1] + 1, k[p + 1] - 1);
+            let mut best = (local(&fits, p), k[p], None);
+            for cand in k[p].saturating_sub(4).max(lo)..=(k[p] + 4).min(hi) {
+                if cand == k[p] {
+                    continue;
+                }
+                let mut trial = k.clone();
+                trial[p] = cand;
+                let mut tf = fits.clone();
+                r.refresh(&trial, &mut tf, p);
+                let score = local(&tf, p);
+                if tf.iter().all(|f| f.0 <= 1.0) && score < best.0 - 1e-3 {
+                    best = (score, cand, Some(tf));
+                }
+            }
+            if let (cand, Some(tf)) = (best.1, best.2) {
+                k[p] = cand;
+                fits = tf;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    k
+}
+
+/// `fps` and `loop` of the QC's `$sequence` / `$animation` that uses `smd` (if any).
+pub fn qc_sequence_settings(qc_path: &Path, smd: &Path) -> (Option<f32>, Option<bool>) {
+    let Ok(q) = Qc::load(qc_path) else { return (None, None) };
+    let stem = smd.file_stem().map(|s| s.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
+    for c in q.commands.iter().filter(|c| c.name == "$sequence" || c.name == "$animation") {
+        let uses = c.args.iter().any(|t| {
+            let t = t.text.replace('\\', "/").to_ascii_lowercase();
+            let file = t.rsplit('/').next().unwrap_or(&t);
+            file == stem || file.strip_suffix(".smd").map(|s| s == stem).unwrap_or(false)
+        });
+        if !uses {
+            continue;
+        }
+        let mut fps = None;
+        let mut looping = None;
+        for (i, t) in c.args.iter().enumerate() {
+            if t.text.eq_ignore_ascii_case("fps") {
+                fps = c.args.get(i + 1).and_then(|v| v.text.parse::<f32>().ok());
+            }
+            if t.text.eq_ignore_ascii_case("loop") {
+                looping = Some(true);
+            }
+        }
+        return (fps, looping);
+    }
+    (None, None)
+}
+
 /// Next free "<qc>_animation_N" name in a folder.
 pub fn next_auto_name(dir: &Path, qc_name: &str) -> String {
     let mut n = 1;
@@ -745,6 +1265,39 @@ mod tests {
             meshes: vec![],
             cdmaterials: vec![],
             warnings: vec![],
+            eyeballs: vec![],
+        }
+    }
+
+    /// Baking a pose-to-pose animation to one key per frame (what an SMD export + import does)
+    /// and reducing it gives the original keys and eases back.
+    #[test]
+    fn reduce_recovers_pose_to_pose_keys() {
+        let r = rig();
+        let mut d = AnimDoc::new(&r);
+        d.frames = 60;
+        let pose = |a: f32, b: f32| {
+            let mut p = r.bind.clone();
+            p[1].1 = Quat::from_rotation_z(a);
+            p[2].1 = Quat::from_rotation_y(b);
+            p
+        };
+        d.keys.insert(0, Keyframe { pose: pose(0.0, 0.0), ease: Ease::Spline });
+        d.keys.insert(12, Keyframe { pose: pose(0.8, 0.3), ease: Ease::Spline });
+        d.keys.insert(25, Keyframe { pose: pose(1.2, -0.4), ease: Ease::Smooth });
+        d.keys.insert(40, Keyframe { pose: pose(-0.5, 0.9), ease: Ease::Linear });
+        d.keys.insert(50, Keyframe { pose: pose(0.2, 0.1), ease: Ease::Smooth });
+        let mut baked = d.clone();
+        baked.keys = (0..d.frames).map(|f| (f, Keyframe { pose: d.sample(f as f32, &r.bind), ease: Ease::Linear })).collect();
+        reduce_keys(&mut baked, &r);
+        let got: Vec<(u32, Ease)> = baked.keys.iter().map(|(f, k)| (*f, k.ease)).collect();
+        assert_eq!(got.iter().map(|g| g.0).collect::<Vec<_>>(), vec![0, 12, 25, 40, 50], "{got:?}");
+        assert_eq!(got[0].1, Ease::Spline);
+        assert_eq!(got[2].1, Ease::Smooth);
+        assert_eq!(got[3].1, Ease::Linear);
+        for f in 0..d.frames {
+            let (a, b) = (d.sample(f as f32, &r.bind), baked.sample(f as f32, &r.bind));
+            assert!(a.iter().zip(&b).all(|(x, y)| x.1.angle_between(y.1).to_degrees() <= REDUCE_ROT_TOL_DEG + 1e-3), "frame {f}");
         }
     }
 
@@ -778,5 +1331,35 @@ mod tests {
         let w = r.world(&pose);
         let e: Vec3 = w[3].translation.into();
         assert!((e - target).length() < 0.5, "{e:?}");
+    }
+
+    /// Dragging the elbow swings it round the shoulder-hand line with the hand fixed, and
+    /// moving the hand afterwards keeps the swing instead of snapping back.
+    #[test]
+    fn elbow_swing_keeps_hand_and_persists() {
+        let r = rig();
+        let chain = detect_chains(&r)[0].bones.clone();
+        let mut pose = r.bind.clone();
+        solve_ik(&r, &mut pose, &chain, Vec3::new(14.0, 0.0, 10.0)); // bend the arm
+        let pos = |p: &[(Vec3, Quat)], i: usize| -> Vec3 { r.world(p)[i].translation.into() };
+        let (shoulder, hand) = (pos(&pose, 1), pos(&pose, 3));
+        let axis = (hand - shoulder).normalize();
+        let bend_dir = |p: &[(Vec3, Quat)]| {
+            let e = pos(p, 2) - shoulder;
+            (e - axis * e.dot(axis)).normalize()
+        };
+        let natural = bend_dir(&pose);
+        // swing the elbow 90 degrees round the arm
+        let side = axis.cross(natural);
+        swing_limb(&r, &mut pose, &chain, shoulder + axis * 7.0 + side * 20.0);
+        assert!(pos(&pose, 3).distance(hand) < 1e-3, "hand moved");
+        let swung = bend_dir(&pose);
+        assert!(swung.dot(side) > 0.99, "elbow did not swing: {swung:?}");
+        // move the hand a little: the elbow stays swung
+        solve_ik(&r, &mut pose, &chain, hand + Vec3::new(-0.5, 0.0, 0.3));
+        let e = pos(&pose, 2) - shoulder;
+        let axis2 = (pos(&pose, 3) - shoulder).normalize();
+        let after = (e - axis2 * e.dot(axis2)).normalize();
+        assert!(after.dot(side) > 0.95, "swing snapped back: {after:?}");
     }
 }

@@ -6,7 +6,7 @@ use crate::formats::mdl::*;
 use crate::formats::phy::Phy;
 use crate::formats::vtf;
 use crate::gamefs::GameFs;
-use crate::render::{Blend, DrawCall, GpuVertex, LineVertex, TextureUpload, line, wire_box};
+use crate::render::{Blend, DrawCall, GpuVertex, IrisDraw, LineVertex, TextureUpload, line, wire_box};
 use glam::{Affine3A, Mat3, Quat, Vec3};
 use std::path::Path;
 use std::sync::Arc;
@@ -29,6 +29,51 @@ pub struct MaterialInfo {
     pub paintable: bool,
     pub color: [f32; 3],
     pub error: Option<String>,
+    /// Eyes / EyeRefract: the `$iris` texture (upload key), projected onto the eyeball
+    pub iris_texture: Option<String>,
+    /// how the iris combines with the base: see [`IrisMode`]
+    pub iris_mode: IrisMode,
+    /// EyeRefract `$dilation` (0.5 = the texture as painted)
+    pub dilation: f32,
+}
+
+/// The iris of an `Eyes` / `EyeRefract` material.
+pub struct IrisMaterial {
+    /// upload key of the (clamped) `$iris` texture
+    pub texture: String,
+    pub mode: IrisMode,
+    pub dilation: f32,
+}
+
+/// Load the `$iris` texture of an eye material into `uploads`. `None` for other shaders,
+/// `Some(Err)` when the iris texture is missing.
+pub fn load_iris(fs: &GameFs, kv: &Kv, uploads: &mut Vec<TextureUpload>) -> Option<Result<IrisMaterial, String>> {
+    let shader = kv.key.to_ascii_lowercase();
+    let mode = match shader.as_str() {
+        "eyes" | "eyes_dx6" => IrisMode::OverBase,
+        "eyerefract" | "eyerefract_dx9" => IrisMode::Replace,
+        _ => return None,
+    };
+    let ir = kv.get_str("$iris")?;
+    let tp = format!("materials/{}.vtf", ir.replace('\\', "/").trim_end_matches(".vtf"));
+    let Some(img) = fs.read(&tp).and_then(|d| vtf::decode(&d, 1024).ok()) else { return Some(Err(format!("{tp} not found"))) };
+    // clamped: outside the iris the edge colour (sclera) continues
+    let key = format!("clamp:{tp}");
+    if !uploads.iter().any(|u| u.key == key) {
+        uploads.push(TextureUpload { key: key.clone(), width: img.width, height: img.height, rgba: Arc::new(img.pixels), clamp: true });
+    }
+    let dilation = kv.get_str("$dilation").and_then(|s| s.trim().parse().ok()).unwrap_or(0.5);
+    Some(Ok(IrisMaterial { texture: key, mode, dilation }))
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum IrisMode {
+    #[default]
+    None,
+    /// `Eyes` shader: sclera `$basetexture` with the iris laid over it by the iris alpha
+    OverBase,
+    /// `EyeRefract`: the projected iris texture is the whole eyeball (it includes the sclera)
+    Replace,
 }
 
 /// An animation source: the model itself (index 0) or one of its `$includemodel`s.
@@ -301,6 +346,18 @@ impl ModelScene {
                         },
                         None => m.error = Some(format!("{tp} not found")),
                     }
+                }
+                match load_iris(fs, &kv, &mut self.uploads) {
+                    Some(Ok(iris)) => {
+                        if iris.mode == IrisMode::Replace {
+                            m.error = None; // EyeRefract has no $basetexture; the iris is the eye
+                        }
+                        m.iris_texture = Some(iris.texture);
+                        m.iris_mode = iris.mode;
+                        m.dilation = iris.dilation;
+                    }
+                    Some(Err(e)) if m.error.is_none() => m.error = Some(e),
+                    _ => {}
                 }
             } else {
                 m.error = Some(format!("{vmt} could not be parsed"));
@@ -655,7 +712,15 @@ impl ModelScene {
                         color = t;
                     }
                 }
-                draws.push(DrawCall { first, count, texture, blend, alpha_ref, cull, tint: [color[0], color[1], color[2], 1.0], selfillum });
+                let iris = mat.and_then(|mm| Some((mm, mm.iris_texture.clone()?))).and_then(|(mm, tex)| {
+                    // eyeball meshes are tagged materialtype 1 with the eyeball index as param
+                    let e = model.eyeballs.get(usize::try_from(mesh.material_param).ok()?).filter(|_| mesh.material_type == 1)?;
+                    let bw = world.get(usize::try_from(e.bone).ok()?)?;
+                    let (u, v) = iris_projection(bw.transform_point3(e.org), bw.transform_vector3(e.forward), bw.transform_vector3(e.up), e.iris_scale, e.radius);
+                    Some(IrisDraw { texture: tex, u, v, replace: mm.iris_mode == IrisMode::Replace, dilation: mm.dilation })
+                });
+                let texture = if iris.as_ref().is_some_and(|i| i.replace) { None } else { texture };
+                draws.push(DrawCall { first, count, texture, blend, alpha_ref, cull, tint: [color[0], color[1], color[2], 1.0], selfillum, iris });
             }
         }
     }
@@ -727,6 +792,21 @@ impl ModelScene {
     }
 }
 
+/// World-space iris projection for an eyeball (centre `org`, looking along `forward`) looking
+/// straight ahead (the engine's `R_StudioEyeballPosition`): u/v = dot(axis, pos - org) *
+/// iris_scale + 0.5, with the axes being the eye's right and up. `iris_scale` is
+/// 1 / (iris size in units), the QC's last `eyeball` value inverted.
+pub fn iris_projection(org: Vec3, forward: Vec3, up: Vec3, iris_scale: f32, radius: f32) -> ([f32; 4], [f32; 4]) {
+    let forward = forward.normalize_or(Vec3::X);
+    let up0 = up.normalize_or(Vec3::Z);
+    let right = forward.cross(up0).normalize_or(Vec3::Y);
+    let up = right.cross(forward).normalize_or(Vec3::Z);
+    let s = if iris_scale.abs() > 1e-6 { iris_scale } else { 1.0 / (radius.max(0.01) * 2.0) };
+    let mu = -right * s;
+    let mv = -up * s;
+    ([mu.x, mu.y, mu.z, 0.5 - mu.dot(org)], [mv.x, mv.y, mv.z, 0.5 - mv.dot(org)])
+}
+
 /// Load a VMT, resolving `patch` materials (include + insert/replace).
 pub fn load_vmt(fs: &GameFs, path: &str, depth: usize) -> Option<Kv> {
     if depth > 4 {
@@ -752,5 +832,47 @@ pub fn load_vmt(fs: &GameFs, path: &str, depth: usize) -> Option<Kv> {
         }
         root = base;
     }
+    apply_dx_fallbacks(&mut root);
     Some(root)
+}
+
+/// Is a VMT sub-block key a shader-fallback condition the game would apply on a modern
+/// (DX9 / SM2.0b+) card? e.g. `">=dx90_20b"`, `"dx9"`, `">dx80"`. `"<dx90_20b"`, `"dx8"`,
+/// `"Eyes_dx8"` (dx8 shader fallback) and `"360?..."` are not.
+fn dx_condition_applies(key: &str) -> bool {
+    let k = key.to_ascii_lowercase();
+    if k.starts_with('<') || k.ends_with("_dx8") || k.ends_with("_dx7") || k.ends_with("_dx6") {
+        return false;
+    }
+    let k = k.trim_start_matches(">=").trim_start_matches('>');
+    k.starts_with("dx9") || (k.starts_with("dx8") && key.starts_with('>')) || k.starts_with("hdr") || k == "srgb"
+}
+
+/// Merge the shader-fallback blocks that apply (`">=dx90_20b" { "$basetexture" ... }`) into the
+/// material's top level and drop the rest - HL2's Combine soldier keeps its whole texture
+/// setup in such a block.
+fn apply_dx_fallbacks(root: &mut Kv) {
+    let keyvalues::KvValue::Block(children) = &mut root.value else { return };
+    let mut merged: Vec<Kv> = Vec::new();
+    children.retain(|c| {
+        if !matches!(c.value, keyvalues::KvValue::Block(_)) || c.key.starts_with('$') || c.key.eq_ignore_ascii_case("proxies") {
+            return true;
+        }
+        let k = c.key.to_ascii_lowercase();
+        let is_cond = k.starts_with('<') || k.starts_with('>') || k.starts_with("dx") || k.ends_with("_dx8") || k.ends_with("_dx7") || k.ends_with("_dx6") || k == "hdr" || k == "ldr" || k == "srgb";
+        if !is_cond {
+            return true;
+        }
+        if dx_condition_applies(&c.key) {
+            merged.extend(c.children().iter().cloned());
+        }
+        false
+    });
+    for kv in merged {
+        if let Some(existing) = children.iter_mut().find(|c| c.key.eq_ignore_ascii_case(&kv.key)) {
+            *existing = kv;
+        } else {
+            children.push(kv);
+        }
+    }
 }

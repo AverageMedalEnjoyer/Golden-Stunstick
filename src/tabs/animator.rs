@@ -3,7 +3,7 @@
 use crate::anim::{self, AnimDoc, Ease, IkChain, Keyframe, Rig};
 use crate::app::Shared;
 use crate::formats::mdl::{euler_to_quat, quat_to_euler};
-use crate::render::{self, Blend, DrawCall, FrameData, GpuVertex, OrbitCamera, RenderMode, TextureUpload};
+use crate::render::{self, Blend, DrawCall, FlyCamera, FrameData, GpuVertex, RenderMode, TextureUpload};
 use eframe::egui::{self, Color32, RichText};
 use glam::{Affine3A, Quat, Vec3};
 use std::collections::HashMap;
@@ -17,6 +17,7 @@ enum Modal {
     OpenList(Vec<PathBuf>),
     QcMissing { doc: AnimDoc, path: PathBuf },
     RigMismatch { doc: AnimDoc, diffs: Vec<String>, path: PathBuf },
+    ImportMismatch { smd: Box<crate::formats::smd::Smd>, m: Box<anim::SmdMatch>, path: PathBuf },
     ConfirmDiscard(Box<PendingAction>),
 }
 
@@ -52,6 +53,120 @@ enum PendingAction {
     NewAnim,
     OpenQc(PathBuf),
     OpenAnim(PathBuf),
+    ImportSmd(PathBuf),
+}
+
+/// Posing tool: Move (arrows) or Rotate (rings). Right-click a bone to switch.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Tool {
+    Move,
+    Rotate,
+}
+
+/// Gizmo handle being dragged.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Handle {
+    /// centre: move freely in the view plane
+    Free,
+    MoveH,
+    MoveV,
+    /// turn left / right (around the vertical axis)
+    RotH,
+    /// tilt up / down (around the camera's horizontal axis)
+    RotV,
+    /// twist around the view direction
+    Twist,
+}
+
+const GZ_LEN: f32 = 72.0;
+const GZ_RING: f32 = 60.0;
+const GZ_FLAT: f32 = 0.34;
+const GZ_TWIST: f32 = 84.0;
+const GZ_CENTER: f32 = 8.0;
+
+/// Screen-space layout of the gizmo on the selected bone.
+struct Gizmo {
+    c: egui::Pos2,
+    /// screen direction of the horizontal / vertical move axes
+    h: egui::Vec2,
+    v: egui::Vec2,
+    /// screen pixels per world unit along those axes
+    h_ppu: f32,
+    v_ppu: f32,
+    /// world units per screen pixel at the bone
+    upp: f32,
+}
+
+fn seg_dist(p: egui::Pos2, a: egui::Pos2, b: egui::Pos2) -> f32 {
+    let ab = b - a;
+    let t = ((p - a).dot(ab) / ab.length_sq().max(1e-6)).clamp(0.0, 1.0);
+    (a + ab * t).distance(p)
+}
+
+fn ellipse_points(c: egui::Pos2, rx: f32, ry: f32) -> Vec<egui::Pos2> {
+    (0..=48).map(|i| i as f32 / 48.0 * std::f32::consts::TAU).map(|t| c + egui::vec2(t.cos() * rx, t.sin() * ry)).collect()
+}
+
+fn poly_dist(p: egui::Pos2, pts: &[egui::Pos2]) -> f32 {
+    pts.windows(2).map(|w| seg_dist(p, w[0], w[1])).fold(f32::MAX, f32::min)
+}
+
+impl Gizmo {
+    fn hit(&self, tool: Tool, p: egui::Pos2) -> Option<Handle> {
+        if p.distance(self.c) <= GZ_CENTER + 3.0 {
+            return Some(Handle::Free);
+        }
+        let mut best: Option<(f32, Handle)> = None;
+        let mut consider = |d: f32, h: Handle| {
+            if d < 7.0 && best.map(|b| d < b.0).unwrap_or(true) {
+                best = Some((d, h));
+            }
+        };
+        match tool {
+            Tool::Move => {
+                consider(seg_dist(p, self.c + self.h * 10.0, self.c + self.h * (GZ_LEN + 6.0)), Handle::MoveH);
+                consider(seg_dist(p, self.c + self.v * 10.0, self.c + self.v * (GZ_LEN + 6.0)), Handle::MoveV);
+            }
+            Tool::Rotate => {
+                consider(poly_dist(p, &ellipse_points(self.c, GZ_RING, GZ_RING * GZ_FLAT)), Handle::RotH);
+                consider(poly_dist(p, &ellipse_points(self.c, GZ_RING * GZ_FLAT, GZ_RING)), Handle::RotV);
+                consider((p.distance(self.c) - GZ_TWIST).abs(), Handle::Twist);
+            }
+        }
+        best.map(|b| b.1)
+    }
+
+    fn paint(&self, painter: &egui::Painter, tool: Tool, hot: Option<Handle>) {
+        let col = |base: Color32, h: Handle| if hot == Some(h) { Color32::from_rgb(255, 245, 140) } else { base };
+        let width = |h: Handle| if hot == Some(h) { 3.5 } else { 2.5 };
+        let red = Color32::from_rgb(235, 85, 80);
+        let green = Color32::from_rgb(95, 220, 100);
+        let shadow = egui::Stroke::new(5.0, Color32::from_black_alpha(110));
+        match tool {
+            Tool::Move => {
+                for (dir, h, base) in [(self.h, Handle::MoveH, red), (self.v, Handle::MoveV, green)] {
+                    let tip = self.c + dir * GZ_LEN;
+                    let from = self.c + dir * (GZ_CENTER + 3.0);
+                    painter.line_segment([from, tip], shadow);
+                    painter.line_segment([from, tip], egui::Stroke::new(width(h), col(base, h)));
+                    let n = egui::vec2(-dir.y, dir.x);
+                    painter.add(egui::Shape::convex_polygon(vec![tip + dir * 12.0, tip + n * 6.0, tip - n * 6.0], col(base, h), egui::Stroke::new(1.0, Color32::from_black_alpha(150))));
+                }
+            }
+            Tool::Rotate => {
+                let twist = Color32::from_rgb(200, 200, 210);
+                painter.circle_stroke(self.c, GZ_TWIST, shadow);
+                painter.circle_stroke(self.c, GZ_TWIST, egui::Stroke::new(width(Handle::Twist) - 0.5, col(twist, Handle::Twist)));
+                for (rx, ry, h, base) in [(GZ_RING, GZ_RING * GZ_FLAT, Handle::RotH, red), (GZ_RING * GZ_FLAT, GZ_RING, Handle::RotV, green)] {
+                    let pts = ellipse_points(self.c, rx, ry);
+                    painter.add(egui::Shape::line(pts.clone(), shadow));
+                    painter.add(egui::Shape::line(pts, egui::Stroke::new(width(h), col(base, h))));
+                }
+            }
+        }
+        let cc = if hot == Some(Handle::Free) { Color32::from_rgb(255, 245, 140) } else { Color32::from_rgb(240, 200, 70) };
+        painter.circle(self.c, GZ_CENTER, cc, egui::Stroke::new(1.5, Color32::from_black_alpha(170)));
+    }
 }
 
 pub struct AnimatorTab {
@@ -60,12 +175,25 @@ pub struct AnimatorTab {
     doc_path: Option<PathBuf>,
     dirty: bool,
     materials: HashMap<String, (Option<String>, bool, Option<f32>)>,
+    /// eye materials (Eyes / EyeRefract) by SMD material name
+    irises: HashMap<String, crate::scene::IrisMaterial>,
+    cli_shot: Option<CliShot>,
     uploads: Vec<TextureUpload>,
-    camera: OrbitCamera,
+    camera: FlyCamera,
+    /// rough size of the model (focus distance for F on a bone)
+    model_radius: f32,
+    model_center: Vec3,
+    tool: Tool,
+    /// the gizmo handle being dragged
+    drag_handle: Option<Handle>,
+    /// moving a non-IK bone translates it instead of turning its parent
+    move_translates: bool,
     frame: f32,
     playing: bool,
     last_tick: Option<Instant>,
     sel_bone: Option<usize>,
+    /// timeline shows only the keys that move the selected bone
+    keys_for_bone: bool,
     bone_filter: String,
     chains: Vec<IkChain>,
     easy_rig: bool,
@@ -77,8 +205,6 @@ pub struct AnimatorTab {
     undo: Vec<std::collections::BTreeMap<u32, Keyframe>>,
     redo: Vec<std::collections::BTreeMap<u32, Keyframe>>,
     in_gesture: bool,
-    /// a left drag that started on a joint: it moves that bone instead of orbiting
-    bone_drag: bool,
     fade_from: u32,
     fade_to: u32,
     fade_ease: Ease,
@@ -90,6 +216,14 @@ pub struct AnimatorTab {
     auto_stand: bool,
 }
 
+/// A `--screenshot` request from the command line (with `--qc`).
+struct CliShot {
+    path: std::path::PathBuf,
+    focus: Option<(String, f32)>,
+    frames: u32,
+    taken: bool,
+}
+
 impl Default for AnimatorTab {
     fn default() -> Self {
         AnimatorTab {
@@ -98,12 +232,20 @@ impl Default for AnimatorTab {
             doc_path: None,
             dirty: false,
             materials: HashMap::new(),
+            irises: HashMap::new(),
+            cli_shot: None,
             uploads: Vec::new(),
-            camera: OrbitCamera { yaw: 0.0, ..OrbitCamera::default() },
+            camera: FlyCamera::default(),
+            model_radius: 40.0,
+            model_center: Vec3::ZERO,
+            tool: Tool::Move,
+            drag_handle: None,
+            move_translates: false,
             frame: 0.0,
             playing: false,
             last_tick: None,
             sel_bone: None,
+            keys_for_bone: false,
             bone_filter: String::new(),
             chains: Vec::new(),
             easy_rig: false,
@@ -115,7 +257,6 @@ impl Default for AnimatorTab {
             undo: Vec::new(),
             redo: Vec::new(),
             in_gesture: false,
-            bone_drag: false,
             fade_from: 0,
             fade_to: 10,
             fade_ease: Ease::Smooth,
@@ -155,9 +296,11 @@ impl AnimatorTab {
                         mx = mx.max(x.translation.into());
                     }
                 }
-                self.camera = OrbitCamera { yaw: 0.0, ..OrbitCamera::default() };
+                self.camera = FlyCamera::default();
                 let (dmn, dmx) = rotated_bounds(self.display_rot, mn, mx);
                 self.camera.frame_bounds(dmn, dmx);
+                self.model_radius = ((dmx - dmn).length() * 0.5).max(1.0);
+                self.model_center = (dmn + dmx) * 0.5;
                 self.chains.clear();
                 self.easy_rig = false;
                 self.sel_bone = None;
@@ -185,8 +328,25 @@ impl AnimatorTab {
         }
     }
 
+    /// `--screenshot <png> [--focus-bone <bone> [--focus-dist <units>]]` with `--qc`: save the
+    /// animator viewport once it has settled, then close the app.
+    pub fn cli_screenshot(&mut self, path: std::path::PathBuf, focus: Option<(String, f32)>) {
+        self.cli_shot = Some(CliShot { path, focus, frames: 0, taken: false });
+    }
+
+    /// `--bone <name>` selects a bone, `--tool move|rotate` picks the posing tool.
+    pub fn cli_select(&mut self, bone: Option<&str>, tool: Option<&str>) {
+        if let (Some(rig), Some(b)) = (&self.rig, bone) {
+            self.sel_bone = rig.bone_index(b);
+        }
+        if let Some(t) = tool {
+            self.tool = if t.eq_ignore_ascii_case("rotate") { Tool::Rotate } else { Tool::Move };
+        }
+    }
+
     fn load_materials(&mut self, rig: &Rig, sh: &Shared) {
         self.materials.clear();
+        self.irises.clear();
         self.uploads.clear();
         self.materials_with_fs = sh.fs.is_some();
         let Some(fs) = &sh.fs else { return };
@@ -210,6 +370,9 @@ impl AnimatorTab {
                                 entry.0 = Some(tp);
                             }
                         }
+                    }
+                    if let Some(Ok(iris)) = crate::scene::load_iris(fs, &kv, &mut self.uploads) {
+                        self.irises.insert(name.clone(), iris);
                     }
                 }
             }
@@ -370,7 +533,54 @@ impl AnimatorTab {
                 self.load_qc(&p, sh);
             }
             PendingAction::OpenAnim(p) => self.open_anim_file(&p, sh),
+            PendingAction::ImportSmd(p) => self.import_smd(&p, sh),
         }
+    }
+
+    /// Import an SMD animation: warn first if its bones differ from the QC's.
+    fn import_smd(&mut self, path: &Path, sh: &mut Shared) {
+        let Some(rig) = &self.rig else { return };
+        let smd = match std::fs::read_to_string(path).map_err(|e| e.to_string()).and_then(|t| crate::formats::smd::Smd::parse(&t)) {
+            Ok(s) => s,
+            Err(e) => {
+                sh.error(format!("Could not read {}: {e}", path.display()));
+                return;
+            }
+        };
+        if smd.frames.is_empty() || smd.nodes.is_empty() {
+            sh.error(format!("{} has no skeleton animation (no 'nodes' / 'skeleton' frames).", path.display()));
+            return;
+        }
+        let m = anim::match_smd(&smd, rig);
+        if m.diffs.is_empty() {
+            self.finish_import(&smd, &m, path);
+        } else {
+            self.modal = Modal::ImportMismatch { smd: Box::new(smd), m: Box::new(m), path: path.to_path_buf() };
+        }
+    }
+
+    fn finish_import(&mut self, smd: &crate::formats::smd::Smd, m: &anim::SmdMatch, path: &Path) {
+        let Some(rig) = &self.rig else { return };
+        let (fps, looping) = anim::qc_sequence_settings(&rig.qc_path, path);
+        let mut doc = anim::import_smd(smd, rig, m, fps.unwrap_or(30.0), looping.unwrap_or(false));
+        // the SMD has one pose per frame; turn it back into pose-to-pose keys
+        anim::reduce_keys(&mut doc, rig);
+        let file = path.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+        self.status = format!(
+            "Imported {file}: {} frames at {} fps{}, {} keys (frames between keys are reproduced within {}\u{00b0}). Not saved yet: Save adds it to the session's animations.",
+            doc.frames,
+            doc.fps,
+            if fps.is_some() { " (from the QC's $sequence)" } else { "" },
+            doc.keys.len(),
+            anim::REDUCE_ROT_TOL_DEG,
+        );
+        self.doc = Some(doc);
+        self.doc_path = None;
+        self.dirty = true;
+        self.undo.clear();
+        self.redo.clear();
+        self.frame = 0.0;
+        self.playing = false;
     }
 
     pub fn ui(&mut self, ui: &mut egui::Ui, sh: &mut Shared) {
@@ -491,6 +701,12 @@ impl AnimatorTab {
                 let current = self.doc.as_ref().and_then(|d| d.name.clone()).unwrap_or_default();
                 self.modal = Modal::SaveAs(current);
             }
+            if ui.add_enabled(has, egui::Button::new("Import SMD...")).on_hover_text("Open an SMD animation on this QC's skeleton (one key per frame). It is not saved until you press Save.").clicked() {
+                let dir = self.rig.as_ref().and_then(|r| r.qc_path.parent().map(|p| p.to_path_buf())).unwrap_or_default();
+                if let Some(p) = rfd::FileDialog::new().set_directory(dir).add_filter("SMD animation", &["smd"]).pick_file() {
+                    self.run_or_confirm(PendingAction::ImportSmd(p), sh);
+                }
+            }
             ui.separator();
             if ui.add_enabled(has, egui::Button::new("Export SMD...")).clicked() {
                 self.export(sh, false);
@@ -525,6 +741,15 @@ impl AnimatorTab {
                 self.display_rot = if self.auto_stand { stand_up_rotation(rig) } else { Quat::IDENTITY };
             }
         });
+        ui.separator();
+        // ---- posing tool
+        ui.label(RichText::new("Posing tool").strong());
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut self.tool, Tool::Move, "Move").on_hover_text("Arrows: move sideways (red) or up/down (green). Centre: move freely");
+            ui.selectable_value(&mut self.tool, Tool::Rotate, "Rotate").on_hover_text("Rings: turn left/right (red), tilt up/down (green), twist (outer). Centre: move freely");
+            ui.label(RichText::new("right-click a bone to switch").small().weak());
+        });
+        ui.checkbox(&mut self.move_translates, "Moving a bone stretches it").on_hover_text("Off: moving a bone that isn't an IK hand/foot swings it around its parent's joint, so bone lengths stay the same.\nOn: the bone itself is translated (like Source Filmmaker's move tool).");
         ui.separator();
         // ---- easy rig
         ui.label(RichText::new("Easy rig (IK)").strong());
@@ -565,7 +790,7 @@ impl AnimatorTab {
                 }
             }
         }
-        ui.label(RichText::new("Drag a joint to pose it: an IK hand/foot (green) moves the whole limb, any other bone rotates. Drag empty space to orbit. Ctrl+drag works on the selected bone from anywhere.").small().weak());
+        ui.label(RichText::new("Drag a joint or the gizmo to pose: an IK hand/foot (green) pulls the whole limb, an elbow/knee (blue) swings it while the hand/foot stays put, Rotate turns the bone itself. Drag empty space to orbit. Ctrl+drag moves the selected bone from anywhere.").small().weak());
         ui.separator();
 
         // ---- selected bone transform
@@ -648,6 +873,24 @@ impl AnimatorTab {
         let Some(rig) = &self.rig else { return };
         let Some(doc) = &mut self.doc else { return };
         let mut changed_doc = false;
+        // "Selected bone's keys": the keys where the selected bone changes from the key before.
+        // Keys stay whole-pose (pose to pose); this only filters what the track shows.
+        let bone_filter = self.sel_bone.filter(|_| self.keys_for_bone);
+        let moves_bone: std::collections::BTreeSet<u32> = match bone_filter {
+            Some(b) => {
+                let mut prev: Option<(Vec3, Quat)> = None;
+                let mut set = std::collections::BTreeSet::new();
+                for (f, k) in &doc.keys {
+                    let cur = k.pose.get(b).copied().unwrap_or(rig.bind[b]);
+                    if prev.is_none_or(|p| p.0.distance(cur.0) > 1e-3 || p.1.angle_between(cur.1).to_degrees() > 0.05) {
+                        set.insert(*f);
+                    }
+                    prev = Some(cur);
+                }
+                set
+            }
+            None => doc.keys.keys().copied().collect(),
+        };
         ui.horizontal_wrapped(|ui| {
             if ui.button(if self.playing { "Pause" } else { "Play" }).clicked() {
                 self.playing = !self.playing;
@@ -657,7 +900,7 @@ impl AnimatorTab {
             }
             if ui.button("< key").clicked() {
                 let f = self.frame.round() as u32;
-                if let Some((k, _)) = doc.keys.range(..f).next_back() {
+                if let Some(k) = moves_bone.range(..f).next_back() {
                     self.frame = *k as f32;
                 }
             }
@@ -669,7 +912,7 @@ impl AnimatorTab {
             }
             if ui.button("key >").clicked() {
                 let f = self.frame.round() as u32;
-                if let Some((k, _)) = doc.keys.range(f + 1..).next() {
+                if let Some(k) = moves_bone.range(f + 1..).next() {
                     self.frame = *k as f32;
                 }
             }
@@ -682,6 +925,16 @@ impl AnimatorTab {
             changed_doc |= ui.checkbox(&mut doc.looping, "Loop").changed();
             ui.label("Smoothing");
             changed_doc |= ui.add(egui::Slider::new(&mut doc.smoothing, 0.0..=1.0)).on_hover_text("Blends every transition toward a smooth spline through the keys").changed();
+            ui.separator();
+            ui.checkbox(&mut self.keys_for_bone, "Selected bone's keys").on_hover_text(
+                "Show only the keys where the selected bone moves (< key / key > jump between them). The other keys stay as small dots: keys still hold the whole pose.",
+            );
+            if self.keys_for_bone {
+                match self.sel_bone.and_then(|b| rig.bones.get(b)) {
+                    Some(b) => ui.label(RichText::new(format!("{}: {} of {} keys", b.name, moves_bone.len(), doc.keys.len())).weak()),
+                    None => ui.label(RichText::new("select a bone").weak()),
+                };
+            }
         });
         // track with key markers
         let max = (doc.frames.max(1) - 1) as f32;
@@ -697,6 +950,11 @@ impl AnimatorTab {
         }
         for (k, key) in &doc.keys {
             let x = x_of(*k as f32);
+            if !moves_bone.contains(k) {
+                // a key that leaves the selected bone where it was
+                painter.circle_filled(egui::pos2(x, rect.top() + 11.0), 1.8, Color32::from_gray(110));
+                continue;
+            }
             let c = match key.ease {
                 Ease::Hold => Color32::from_rgb(200, 120, 120),
                 Ease::Linear => Color32::from_rgb(200, 200, 200),
@@ -785,50 +1043,116 @@ impl AnimatorTab {
     fn viewport(&mut self, ui: &mut egui::Ui, sh: &mut Shared) {
         let rect = ui.available_rect_before_wrap();
         let resp = ui.allocate_rect(rect, egui::Sense::click_and_drag());
-        let ctrl = ui.input(|i| i.modifiers.ctrl);
-        // A left drag that starts on a joint grabs that bone; anywhere else it orbits.
-        // (Ctrl + left drag manipulates the selected bone from anywhere.)
-        if resp.drag_started_by(egui::PointerButton::Primary) {
-            self.bone_drag = false;
-            let shift = ui.input(|i| i.modifiers.shift);
-            if !ctrl && !shift && self.show_bones {
-                let origin = ui.input(|i| i.pointer.press_origin());
-                if let (Some(pos), Some(rig), Some(doc)) = (origin, &self.rig, &self.doc) {
-                    let pose = doc.sample(if self.playing { self.frame } else { self.frame.round() }, &rig.bind);
-                    let world = rig.world(&pose);
-                    let vp = self.camera.view_proj(rect.width() / rect.height().max(1.0)) * glam::Mat4::from_quat(self.display_rot);
-                    if let Some(b) = pick_joint(&world, vp, rect, pos) {
-                        self.sel_bone = Some(b);
-                        self.bone_drag = true;
-                        self.playing = false;
-                    }
-                }
-            }
-        }
-        if !resp.dragged() {
-            self.bone_drag = false;
-        }
-        let manip = (ctrl || self.bone_drag) && self.sel_bone.is_some() && resp.dragged_by(egui::PointerButton::Primary);
-        if !manip {
-            self.camera.handle_input(&resp, ui);
-        }
-        let (Some(rig), Some(doc)) = (&self.rig, &self.doc) else { return };
+        let (ctrl, shift) = ui.input(|i| (i.modifiers.ctrl, i.modifiers.shift));
+        let aspect = rect.width() / rect.height().max(1.0);
         // playback
         let now = Instant::now();
         let dt = self.last_tick.map(|t| now.duration_since(t).as_secs_f32()).unwrap_or(0.0).min(0.1);
         self.last_tick = Some(now);
-        let max = (doc.frames.max(1) - 1) as f32;
-        if self.playing {
-            self.frame += dt * doc.fps;
-            if self.frame > max {
-                // the preview always loops; `Loop` controls how the last key blends back to the first
-                self.frame = 0.0;
+        if let Some(doc) = &self.doc {
+            let max = (doc.frames.max(1) - 1) as f32;
+            if self.playing {
+                self.frame += dt * doc.fps;
+                if self.frame > max {
+                    // the preview always loops; `Loop` controls how the last key blends back to the first
+                    self.frame = 0.0;
+                }
+                ui.ctx().request_repaint();
+            }
+        }
+        let shown_frame = if self.playing { self.frame } else { self.frame.round() };
+        let world_now = match (&self.rig, &self.doc) {
+            (Some(rig), Some(doc)) => rig.world(&doc.sample(shown_frame, &rig.bind)),
+            _ => return,
+        };
+        let vp = self.camera.view_proj(aspect) * glam::Mat4::from_quat(self.display_rot);
+        let gizmo = self.gizmo(&world_now, vp, rect);
+        // A left drag that starts on a gizmo handle uses it; on a joint it selects the bone and
+        // moves it freely; anywhere else it orbits. Ctrl + left drag moves the selected bone
+        // from anywhere.
+        if resp.drag_started_by(egui::PointerButton::Primary) {
+            self.drag_handle = None;
+            if let Some(origin) = ui.input(|i| i.pointer.press_origin()) {
+                if ctrl && self.sel_bone.is_some() {
+                    self.drag_handle = Some(Handle::Free);
+                } else if !shift {
+                    if let Some(h) = gizmo.as_ref().and_then(|g| g.hit(self.tool, origin)) {
+                        self.drag_handle = Some(h);
+                    } else if self.show_bones {
+                        if let Some(b) = pick_joint(&world_now, vp, rect, origin) {
+                            self.sel_bone = Some(b);
+                            self.drag_handle = Some(Handle::Free);
+                        }
+                    }
+                }
+            }
+            if self.drag_handle.is_some() {
+                self.playing = false;
+            }
+        }
+        if !resp.dragged() {
+            self.drag_handle = None;
+        }
+        // right-click a bone: select it and switch between Move and Rotate
+        if resp.secondary_clicked() && self.show_bones {
+            if let Some(pos) = resp.interact_pointer_pos() {
+                let on_centre = gizmo.as_ref().map(|g| g.hit(self.tool, pos) == Some(Handle::Free)).unwrap_or(false);
+                let b = if on_centre { self.sel_bone } else { pick_joint(&world_now, vp, rect, pos) };
+                if let Some(b) = b {
+                    self.sel_bone = Some(b);
+                    self.tool = if self.tool == Tool::Move { Tool::Rotate } else { Tool::Move };
+                }
+            }
+        }
+        let manip = self.drag_handle.is_some() && self.sel_bone.is_some() && resp.dragged_by(egui::PointerButton::Primary);
+        if self.camera.handle_input(&resp, ui, !manip) {
+            ui.ctx().request_repaint();
+        }
+        // F: fly to the selected bone (or frame the whole model)
+        if resp.hovered() && !ui.ctx().egui_wants_keyboard_input() && ui.input(|i| i.key_pressed(egui::Key::F)) {
+            match self.sel_bone.and_then(|b| world_now.get(b)) {
+                Some(w) => self.camera.fly_to(self.display_rot * Vec3::from(w.translation), self.model_radius * 0.8),
+                None => self.camera.fly_to(self.model_center, self.model_radius / (self.camera.fov.to_radians() * 0.5).tan() * 1.1),
             }
             ui.ctx().request_repaint();
         }
-        let pose = doc.sample(if self.playing { self.frame } else { self.frame.round() }, &rig.bind);
+        if manip {
+            let d = resp.drag_delta();
+            if d != egui::Vec2::ZERO {
+                if let Some(h) = self.drag_handle {
+                    self.apply_gizmo(h, d, resp.interact_pointer_pos(), rect, vp);
+                }
+            }
+        }
+        let (Some(rig), Some(doc)) = (&self.rig, &self.doc) else { return };
+        let pose = doc.sample(shown_frame, &rig.bind);
         let world = rig.world(&pose);
-        let aspect = rect.width() / rect.height().max(1.0);
+        let mut cli_capture = None;
+        if let Some(shot) = &mut self.cli_shot {
+            // wait for the game to mount (materials come from it)
+            if sh.fs.is_some() {
+                shot.frames += 1;
+            }
+            if shot.frames == 2 {
+                // --focus-bone: fly to that bone
+                if let Some((b, dist)) = shot.focus.as_ref().and_then(|(n, d)| Some((rig.bone_index(n)?, *d))) {
+                    // face the model: look against the eyes' forward direction when it has eyes
+                    if let Some(e) = rig.eyeballs.first() {
+                        let fwd = self.display_rot * world[e.bone].transform_vector3(e.forward);
+                        self.camera.yaw = (-fwd.y).atan2(-fwd.x);
+                        self.camera.pitch = 0.0;
+                    }
+                    self.camera.fly_to(self.display_rot * Vec3::from(world[b].translation), dist);
+                }
+            }
+            if shot.taken {
+                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+            } else if shot.frames >= 120 {
+                cli_capture = Some(shot.path.clone());
+                shot.taken = true;
+            }
+            ui.ctx().request_repaint();
+        }
         let vp = self.camera.view_proj(aspect) * glam::Mat4::from_quat(self.display_rot);
         let bg = sh.theme.viewport_bg;
         let mut f = FrameData {
@@ -837,6 +1161,7 @@ impl AnimatorTab {
             light_dir: Vec3::new(0.6, 0.4, 0.7),
             ambient: 0.35,
             mode: Some(self.mode),
+            screenshot: cli_capture,
             ..Default::default()
         };
         {
@@ -862,7 +1187,17 @@ impl AnimatorTab {
                     let info = mat.and_then(|m| self.materials.get(m));
                     let texture = info.and_then(|i| i.0.clone());
                     let blend = if info.map(|i| i.1).unwrap_or(false) { Blend::Translucent } else if info.and_then(|i| i.2).is_some() { Blend::AlphaTest } else { Blend::Opaque };
-                    f.draws.push(DrawCall { first, count, texture, blend, alpha_ref: info.and_then(|i| i.2).unwrap_or(0.0), cull: false, tint: [1.0; 4], selfillum: false });
+                    // eyes: project the iris from the QC eyeball that uses this material
+                    let iris = mat.and_then(|m| {
+                        let ir = self.irises.get(m)?;
+                        let clean = m.trim_end_matches(".bmp").trim_end_matches(".tga").trim_end_matches(".vmt");
+                        let e = rig.eyeballs.iter().find(|e| e.material.eq_ignore_ascii_case(clean) || e.material.rsplit('/').next().is_some_and(|s| s.eq_ignore_ascii_case(clean)))?;
+                        let bw = world.get(e.bone)?;
+                        let (u, v) = crate::scene::iris_projection(bw.transform_point3(e.org), bw.transform_vector3(e.forward), bw.transform_vector3(e.up), e.iris_scale, e.radius);
+                        Some(crate::render::IrisDraw { texture: ir.texture.clone(), u, v, replace: ir.mode == crate::scene::IrisMode::Replace, dilation: ir.dilation })
+                    });
+                    let texture = if iris.as_ref().is_some_and(|i| i.replace) { None } else { texture };
+                    f.draws.push(DrawCall { first, count, texture, blend, alpha_ref: info.and_then(|i| i.2).unwrap_or(0.0), cull: false, tint: [1.0; 4], selfillum: false, iris });
                 };
                 for t in &m.tris {
                     if cur_mat != Some(t.material.as_str()) {
@@ -905,7 +1240,9 @@ impl AnimatorTab {
         }
         let mut labels = Vec::new();
         let ik_effectors: Vec<usize> = if self.easy_rig { self.chains.iter().filter(|c| c.enabled).filter_map(|c| c.bones.last().copied()).collect() } else { Vec::new() };
-        let sel_chain: Vec<usize> = self.sel_bone.and_then(|b| self.chains.iter().find(|c| c.enabled && self.easy_rig && c.bones.last() == Some(&b))).map(|c| c.bones.clone()).unwrap_or_default();
+        // elbows / knees: dragging them swings the limb (pole control)
+        let ik_joints: Vec<usize> = if self.easy_rig { self.chains.iter().filter(|c| c.enabled && c.bones.len() >= 3).map(|c| c.bones[c.bones.len() - 2]).collect() } else { Vec::new() };
+        let sel_chain: Vec<usize> = self.sel_bone.and_then(|b| self.ik_chain_for(b).or_else(|| self.ik_chain_with_joint(b))).unwrap_or_default();
         if self.show_bones {
             for (i, b) in rig.bones.iter().enumerate() {
                 let p: Vec3 = world[i].translation.into();
@@ -917,8 +1254,18 @@ impl AnimatorTab {
                     render::line(&mut f.overlay_lines, pp, p, c);
                 }
                 // joint marker
-                let s = (self.camera.distance * 0.006).max(0.15);
-                let c = if sel { [1.0, 0.3, 0.3, 1.0] } else if ik_effectors.contains(&i) { [0.3, 1.0, 0.5, 1.0] } else { [1.0, 1.0, 1.0, 0.7] };
+                // a few pixels on screen, whatever the distance
+                let depth = (self.display_rot * p - self.camera.eye).dot(self.camera.forward());
+                let s = self.camera.units_per_pixel(depth, rect.height()) * 4.0;
+                let c = if sel {
+                    [1.0, 0.3, 0.3, 1.0]
+                } else if ik_effectors.contains(&i) {
+                    [0.3, 1.0, 0.5, 1.0]
+                } else if ik_joints.contains(&i) {
+                    [0.35, 0.8, 1.0, 1.0]
+                } else {
+                    [1.0, 1.0, 1.0, 0.7]
+                };
                 for ax in [Vec3::X, Vec3::Y, Vec3::Z] {
                     render::line(&mut f.overlay_lines, p - ax * s, p + ax * s, c);
                 }
@@ -944,44 +1291,144 @@ impl AnimatorTab {
             painter.text(p + egui::vec2(5.0, -3.0), egui::Align2::LEFT_BOTTOM, t, egui::FontId::proportional(12.0), Color32::from_rgb(240, 220, 130));
         }
         painter.text(rect.left_top() + egui::vec2(8.0, 8.0), egui::Align2::LEFT_TOP, format!("{}  frame {:.0}", doc.display_name(), self.frame.round()), egui::FontId::proportional(13.0), Color32::from_white_alpha(200));
+        // gizmo on the selected bone
+        if let Some(g) = self.gizmo(&world, vp, rect) {
+            let hot = self.drag_handle.or_else(|| resp.hover_pos().and_then(|p| g.hit(self.tool, p)));
+            g.paint(&painter, self.tool, hot);
+        }
+        let hint = match self.tool {
+            Tool::Move => "MOVE: drag the red arrow to move sideways, the green arrow up/down, the yellow centre freely",
+            Tool::Rotate => "ROTATE: red ring turns left/right, green ring tilts up/down, outer ring twists, centre moves freely",
+        };
+        painter.text(
+            rect.left_bottom() + egui::vec2(8.0, -8.0),
+            egui::Align2::LEFT_BOTTOM,
+            format!("{hint}\nRight-click a bone: switch Move / Rotate.  Fly: WASD + Q/E (Shift fast, Alt slow), right-drag to look, scroll to dolly, F to focus the selected bone.\nLeft-drag empty space: orbit.  Middle-drag: pan."),
+            egui::FontId::proportional(11.5),
+            Color32::from_white_alpha(170),
+        );
+    }
 
-        // manipulation
-        if manip {
-            let d = resp.drag_delta();
-            if d != egui::Vec2::ZERO {
-                let b = self.sel_bone.unwrap_or(0);
-                let new_pose = {
-                    let (Some(rig), Some(doc)) = (&self.rig, &self.doc) else { return };
-                    let mut pose = doc.sample(self.current_frame() as f32, &rig.bind);
-                    let world = rig.world(&pose);
-                    let eye = self.camera.eye();
-                    let fwd = (self.camera.target - eye).normalize_or(Vec3::X);
-                    let inv = self.display_rot.inverse();
-                    let right = inv * fwd.cross(Vec3::Z).normalize_or(Vec3::Y);
-                    let up = inv * fwd.cross(Vec3::Z).normalize_or(Vec3::Y).cross(fwd).normalize_or(Vec3::Z);
-                    let px = 2.0 * self.camera.distance * (self.camera.fov.to_radians() * 0.5).tan() / rect.height().max(1.0);
-                    let chain = self.chains.iter().find(|c| c.enabled && self.easy_rig && c.bones.last() == Some(&b)).map(|c| c.bones.clone());
-                    match chain {
-                        Some(chain) => {
-                            let target: Vec3 = Vec3::from(world[b].translation) + right * d.x * px - up * d.y * px;
-                            anim::solve_ik(rig, &mut pose, &chain, target);
-                        }
-                        None => {
-                            let parent = rig.bones[b].parent;
-                            let parent_world_rot = if parent >= 0 { world[parent as usize].to_scale_rotation_translation().1 } else { Quat::IDENTITY };
-                            let world_rot = world[b].to_scale_rotation_translation().1;
-                            let r = Quat::from_axis_angle(up, d.x * 0.01) * Quat::from_axis_angle(right, d.y * 0.01);
-                            pose[b].1 = (parent_world_rot.inverse() * (r * world_rot).normalize()).normalize();
-                        }
+    /// The IK chain whose hand/foot is bone `b` (when the easy rig is on).
+    fn ik_chain_for(&self, b: usize) -> Option<Vec<usize>> {
+        if !self.easy_rig {
+            return None;
+        }
+        self.chains.iter().find(|c| c.enabled && c.bones.last() == Some(&b)).map(|c| c.bones.clone())
+    }
+
+    /// The IK chain whose elbow/knee (the bone before the hand/foot) is bone `b`.
+    fn ik_chain_with_joint(&self, b: usize) -> Option<Vec<usize>> {
+        if !self.easy_rig {
+            return None;
+        }
+        self.chains.iter().find(|c| c.enabled && c.bones.len() >= 3 && c.bones[c.bones.len() - 2] == b).map(|c| c.bones.clone())
+    }
+
+    /// Screen layout of the gizmo for the selected bone in pose `world`.
+    fn gizmo(&self, world: &[Affine3A], vp: glam::Mat4, rect: egui::Rect) -> Option<Gizmo> {
+        if !self.show_bones {
+            return None;
+        }
+        let p: Vec3 = world.get(self.sel_bone?)?.translation.into();
+        let c = render::project(vp, rect, p)?;
+        let depth = (self.display_rot * p - self.camera.eye).dot(self.camera.forward());
+        if depth <= self.camera.near * 2.0 {
+            return None;
+        }
+        let upp = self.camera.units_per_pixel(depth, rect.height());
+        let inv = self.display_rot.inverse();
+        let axis = |a: Vec3, fallback: egui::Vec2| -> (egui::Vec2, f32) {
+            let len = upp * GZ_LEN;
+            match render::project(vp, rect, p + inv * a * len) {
+                Some(q) if (q - c).length() > 8.0 => ((q - c).normalized(), (q - c).length() / len),
+                _ => (fallback, 1.0 / upp),
+            }
+        };
+        let (h, h_ppu) = axis(self.camera.right(), egui::vec2(1.0, 0.0));
+        let (v, v_ppu) = axis(Vec3::Z, egui::vec2(0.0, -1.0));
+        Some(Gizmo { c, h, v, h_ppu, v_ppu, upp })
+    }
+
+    /// Apply one frame of dragging handle `h` by `d` screen pixels to the selected bone.
+    fn apply_gizmo(&mut self, h: Handle, d: egui::Vec2, pos: Option<egui::Pos2>, rect: egui::Rect, vp: glam::Mat4) {
+        let Some(b) = self.sel_bone else { return };
+        let new_pose = {
+            let (Some(rig), Some(doc)) = (&self.rig, &self.doc) else { return };
+            let mut pose = doc.sample(self.current_frame() as f32, &rig.bind);
+            let world = rig.world(&pose);
+            let Some(g) = self.gizmo(&world, vp, rect).or_else(|| {
+                // gizmo hidden (bones off): free moves still work
+                let p: Vec3 = world.get(b)?.translation.into();
+                let depth = (self.display_rot * p - self.camera.eye).dot(self.camera.forward());
+                Some(Gizmo { c: egui::Pos2::ZERO, h: egui::vec2(1.0, 0.0), v: egui::vec2(0.0, -1.0), h_ppu: 1.0, v_ppu: 1.0, upp: self.camera.units_per_pixel(depth, rect.height()) })
+            }) else {
+                return;
+            };
+            // camera directions in rig space
+            let inv = self.display_rot.inverse();
+            let right = inv * self.camera.right();
+            let up = inv * self.camera.up();
+            let vertical = inv * Vec3::Z;
+            let toward_camera = inv * -self.camera.forward();
+            match h {
+                Handle::Free => self.move_bone(rig, &mut pose, &world, b, (right * d.x - up * d.y) * g.upp),
+                Handle::MoveH => self.move_bone(rig, &mut pose, &world, b, right * (d.dot(g.h) / g.h_ppu)),
+                Handle::MoveV => self.move_bone(rig, &mut pose, &world, b, vertical * (d.dot(g.v) / g.v_ppu)),
+                Handle::RotH => rotate_bone(rig, &mut pose, &world, b, Quat::from_axis_angle(vertical, d.x / GZ_RING)),
+                Handle::RotV => rotate_bone(rig, &mut pose, &world, b, Quat::from_axis_angle(right, d.y / GZ_RING)),
+                Handle::Twist => {
+                    let Some(p) = pos else { return };
+                    let mut da = (p - g.c).angle() - ((p - d) - g.c).angle();
+                    if da > std::f32::consts::PI {
+                        da -= std::f32::consts::TAU;
+                    } else if da < -std::f32::consts::PI {
+                        da += std::f32::consts::TAU;
                     }
-                    pose
-                };
-                self.begin_edit();
-                if let Some(p) = self.edit_pose() {
-                    *p = new_pose;
+                    // screen y points down: a clockwise drag is a positive screen angle
+                    rotate_bone(rig, &mut pose, &world, b, Quat::from_axis_angle(toward_camera, -da));
                 }
             }
+            pose
+        };
+        self.begin_edit();
+        if let Some(p) = self.edit_pose() {
+            *p = new_pose;
         }
+    }
+
+    /// Move bone `b` by `delta` (rig space): an IK hand/foot drags its limb, the root
+    /// translates, any other bone swings around its parent's joint (or translates when
+    /// "Move stretches bones" is on).
+    fn move_bone(&self, rig: &Rig, pose: &mut [(Vec3, Quat)], world: &[Affine3A], b: usize, delta: Vec3) {
+        if delta == Vec3::ZERO {
+            return;
+        }
+        let p: Vec3 = world[b].translation.into();
+        if let Some(chain) = self.ik_chain_for(b) {
+            anim::solve_ik(rig, pose, &chain, p + delta);
+            return;
+        }
+        if let Some(chain) = self.ik_chain_with_joint(b) {
+            // elbow / knee: swing it around the shoulder-hand (hip-foot) line, hand/foot stays
+            anim::swing_limb(rig, pose, &chain, p + delta);
+            return;
+        }
+        let parent = rig.bones[b].parent;
+        if parent < 0 {
+            pose[b].0 += delta;
+            return;
+        }
+        let pw = world[parent as usize];
+        if !self.move_translates {
+            let pp: Vec3 = pw.translation.into();
+            let (v0, v1) = (p - pp, p + delta - pp);
+            if v0.length() > 1e-3 && v1.length() > 1e-3 {
+                rotate_bone(rig, pose, world, parent as usize, Quat::from_rotation_arc(v0.normalize(), v1.normalize()));
+                return;
+            }
+        }
+        pose[b].0 = pw.inverse().transform_point3(p + delta);
     }
     fn modals(&mut self, ctx: &egui::Context, sh: &mut Shared) {
         let modal = std::mem::replace(&mut self.modal, Modal::None);
@@ -1101,6 +1548,34 @@ impl AnimatorTab {
                     None => Modal::RigMismatch { doc, diffs, path },
                 }
             }
+            Modal::ImportMismatch { smd, m, path } => {
+                let mut choice = None;
+                egui::Window::new("SMD bones don't match the QC").collapsible(false).anchor(center, egui::vec2(0.0, 0.0)).default_size([560.0, 340.0]).show(ctx, |ui| {
+                    ui.colored_label(Color32::from_rgb(240, 200, 90), format!("The skeleton in {} is not the same as this QC's:", path.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default()));
+                    egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
+                        for d in &m.diffs {
+                            ui.label(format!("- {d}"));
+                        }
+                    });
+                    ui.label(RichText::new("Continue imports it anyway, matching bones by name as described above.").weak());
+                    ui.horizontal(|ui| {
+                        if ui.button("Continue").clicked() {
+                            choice = Some(true);
+                        }
+                        if ui.button("Cancel").clicked() {
+                            choice = Some(false);
+                        }
+                    });
+                });
+                match choice {
+                    Some(true) => {
+                        self.finish_import(&smd, &m, &path);
+                        Modal::None
+                    }
+                    Some(false) => Modal::None,
+                    None => Modal::ImportMismatch { smd, m, path },
+                }
+            }
             Modal::ConfirmDiscard(action) => {
                 let mut choice = None;
                 egui::Window::new("Unsaved changes").collapsible(false).resizable(false).anchor(center, egui::vec2(0.0, 0.0)).show(ctx, |ui| {
@@ -1134,6 +1609,14 @@ impl AnimatorTab {
             }
         };
     }
+}
+
+/// Turn bone `b` by world rotation `q` (rig space) about its own joint.
+fn rotate_bone(rig: &Rig, pose: &mut [(Vec3, Quat)], world: &[Affine3A], b: usize, q: Quat) {
+    let parent = rig.bones[b].parent;
+    let parent_rot = if parent >= 0 { world[parent as usize].to_scale_rotation_translation().1.normalize() } else { Quat::IDENTITY };
+    let world_rot = world[b].to_scale_rotation_translation().1.normalize();
+    pose[b].1 = (parent_rot.inverse() * (q * world_rot)).normalize();
 }
 
 /// The joint whose screen position is nearest `pos` (within 14 px), if any.

@@ -377,7 +377,7 @@ impl CompilerTab {
         match &s.studiomdl {
             Some(p) if p.is_file() => {}
             _ => {
-                sh.error("This session has no valid studiomdl.exe. Create a new session with studiomdl.exe set.");
+                sh.error("This session has no valid studiomdl.exe. Right-click the studiomdl.exe path at the top of the window to set one.");
                 return;
             }
         }

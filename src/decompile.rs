@@ -194,7 +194,7 @@ fn contents_names(c: i32) -> Vec<&'static str> {
     v
 }
 
-fn motion_flags(f: i32) -> String {
+pub fn motion_flags(f: i32) -> String {
     let names = [(0x1, "X"), (0x2, "Y"), (0x4, "Z"), (0x8, "XR"), (0x10, "YR"), (0x20, "ZR"), (0x40, "LX"), (0x80, "LY"), (0x100, "LZ"), (0x200, "LXR"), (0x400, "LYR"), (0x800, "LZR"), (0x1000, "LINEAR")];
     names.iter().filter(|(b, _)| f & b != 0).map(|(_, n)| *n).collect::<Vec<_>>().join(" ")
 }
@@ -653,8 +653,12 @@ pub fn anim_frames(mdl: &Mdl, ai: usize, ani: Option<&[u8]>) -> Vec<Vec<(Vec3, V
 /// Convert flex rule RPN to an infix expression.
 /// Approximate the `flexpair` split width. The MDL only keeps per-vertex side
 /// weights, not the original width, so this returns 1 unit when the flex has a
-/// blended seam and 0 for a hard left/right split.
+/// blended seam and a tiny width for a hard left/right split.
+///
+/// Never returns 0: studiomdl treats `flexpair "X" 0` as a plain, unsplit flex named
+/// `X` (no `XL`/`XR`), so every `%XL = ...` rule would then fail with "Rule for unknown flex".
 fn estimate_split(model: &Model, desc: i32) -> f32 {
+    const HARD_SPLIT: f32 = 0.001;
     let mut max_partial = 0.0f32;
     for mesh in &model.meshes {
         for fx in mesh.flexes.iter().filter(|f| f.flexdesc == desc) {
@@ -666,7 +670,7 @@ fn estimate_split(model: &Model, desc: i32) -> f32 {
             }
         }
     }
-    if max_partial > 0.0 { 1.0 } else { 0.0 }
+    if max_partial > 0.0 { 1.0 } else { HARD_SPLIT }
 }
 
 /// Returns `None` for rules that use operators with no QC syntax (DME eyelid / NWAY rules,
@@ -1167,10 +1171,14 @@ fn build_qc(cx: &mut Ctx, phys_file: Option<&str>, vtas: &HashMap<(usize, usize)
             let _ = writeln!(a, "\tsubtract {} 0", quote(&refpose_name));
         }
         // explicit walkframes pin each root-motion piece's end frame (studiomdl otherwise
-        // re-detects the range and can end a piece early)
+        // re-detects the range and can end a piece early). Pieces without motion flags are
+        // written too: they hold the entity still for a while, and leaving them out would merge
+        // that stretch into the next piece's motion.
         for mv in &ad.movements {
             let f = motion_flags(mv.motionflags);
-            if !f.is_empty() {
+            if f.is_empty() {
+                let _ = writeln!(a, "\twalkframe {}", mv.endframe);
+            } else {
                 let _ = writeln!(a, "\twalkframe {} {}", mv.endframe, f);
             }
         }

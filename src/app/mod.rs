@@ -15,6 +15,13 @@ use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 use theme::{BackgroundCache, Theme};
 
+/// Session-header right-click actions; the bool is `true` for gameinfo.txt, `false` for studiomdl.exe.
+enum HeaderAction {
+    Browse(bool),
+    Use(bool, PathBuf),
+    Clear(bool),
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Tab {
     Animator,
@@ -133,14 +140,28 @@ impl GoldenStunstick {
         }
         if let Some(qc) = get("--qc") {
             self.tab = Tab::Animator;
-            if self.animator.load_qc(std::path::Path::new(&qc), &mut self.shared) && args.iter().any(|a| a == "--easy-rig") {
-                self.animator.easy_rig_now();
+            if self.animator.load_qc(std::path::Path::new(&qc), &mut self.shared) {
+                if args.iter().any(|a| a == "--easy-rig") {
+                    self.animator.easy_rig_now();
+                }
+                self.animator.cli_select(get("--bone").as_deref(), get("--tool").as_deref());
             }
         }
         self.pending_model = get("--model");
         self.pending_seq = get("--seq");
+        if args.iter().any(|a| a == "--no-sound") {
+            self.viewer.set_sounds(false);
+        }
         if let Some(p) = get("--viewer-page") {
             self.viewer.set_panel(&p);
+        }
+        if let Some(p) = get("--screenshot") {
+            let focus = get("--focus-bone").map(|b| (b, get("--focus-dist").and_then(|d| d.parse().ok()).unwrap_or(12.0)));
+            if self.tab == Tab::Animator {
+                self.animator.cli_screenshot(PathBuf::from(p), focus);
+            } else {
+                self.viewer.cli_screenshot(PathBuf::from(p), focus);
+            }
         }
         if args.iter().any(|a| a == "--open-session-list") {
             self.open_session = Some(self.shared.files.list_sessions());
@@ -149,19 +170,71 @@ impl GoldenStunstick {
 
     fn start_session(&mut self, s: Session) {
         self.shared.session = Some(s.clone());
-        self.shared.fs = None;
-        self.shared.fs_status = "Mounting game content...".into();
-        let (tx, rx) = std::sync::mpsc::channel();
-        let gi = s.gameinfo.clone();
-        std::thread::spawn(move || {
-            let _ = tx.send(GameFs::mount(&gi, None));
-        });
-        self.mounting = Some(rx);
+        self.mount(&s.gameinfo);
         self.viewer = ModelViewerTab::default();
         self.compiler = CompilerTab::default();
         self.animator = AnimatorTab::default();
         let _ = std::fs::create_dir_all(s.animations_dir());
         let _ = std::fs::create_dir_all(s.logs_dir());
+    }
+
+    /// Mount a gameinfo.txt in the background (a mount already in flight is abandoned).
+    fn mount(&mut self, gameinfo: &std::path::Path) {
+        self.shared.fs = None;
+        self.shared.fs_status = "Mounting game content...".into();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let gi = gameinfo.to_path_buf();
+        std::thread::spawn(move || {
+            let _ = tx.send(GameFs::mount(&gi, None));
+        });
+        self.mounting = Some(rx);
+    }
+
+    /// Header right-click "Replace...": pick a new gameinfo.txt / studiomdl.exe, starting the
+    /// file dialog in the folder of the current one, then save the session (and remount).
+    fn replace_session_path(&mut self, gameinfo: bool) {
+        let Some(s) = self.shared.session.clone() else { return };
+        let current = if gameinfo { Some(s.gameinfo.clone()) } else { s.studiomdl.clone().or_else(|| session::guess_studiomdl(&s.gameinfo)) };
+        // nearest folder that still exists, so a moved install still opens somewhere useful
+        let start = current.as_deref().and_then(|p| p.ancestors().skip(1).find(|d| d.is_dir())).map(PathBuf::from).or_else(|| Some(s.game_dir()).filter(|d| d.is_dir()));
+        let mut dlg = if gameinfo {
+            rfd::FileDialog::new().set_title("Replace gameinfo.txt").add_filter("gameinfo", &["txt"])
+        } else {
+            rfd::FileDialog::new().set_title("Replace studiomdl.exe").add_filter("studiomdl", &["exe"])
+        };
+        if let Some(d) = start {
+            dlg = dlg.set_directory(d);
+        }
+        if let Some(name) = current.as_deref().and_then(|p| p.file_name()) {
+            dlg = dlg.set_file_name(name.to_string_lossy());
+        }
+        if let Some(p) = dlg.pick_file() {
+            self.header_action(HeaderAction::Use(gameinfo, p));
+        }
+    }
+
+    /// Apply a session-header right-click action and save the session.
+    fn header_action(&mut self, a: HeaderAction) {
+        let Some(mut s) = self.shared.session.clone() else { return };
+        let mut remount = false;
+        match a {
+            HeaderAction::Browse(gameinfo) => return self.replace_session_path(gameinfo),
+            HeaderAction::Use(true, p) => {
+                remount = !p.to_string_lossy().eq_ignore_ascii_case(&s.gameinfo.to_string_lossy());
+                s.set_gameinfo(p);
+            }
+            HeaderAction::Use(false, p) => s.set_studiomdl(p),
+            HeaderAction::Clear(true) => s.recent_gameinfo.clear(),
+            HeaderAction::Clear(false) => s.recent_studiomdl.clear(),
+        }
+        if let Err(e) = s.save() {
+            self.error_popup = Some(format!("Could not save {}:\n{e}", s.settings_path().display()));
+            return;
+        }
+        self.shared.session = Some(s.clone());
+        if remount {
+            self.mount(&s.gameinfo);
+        }
     }
 
     fn poll_mount(&mut self) {
@@ -214,18 +287,54 @@ impl GoldenStunstick {
     fn session_header(&mut self, ui: &mut egui::Ui) {
         let Some(s) = &self.shared.session else { return };
         let accent = self.shared.theme.accent;
+        let mut action: Option<HeaderAction> = None;
+        // right-click menu shared by both paths: browse, recent list, clear recent
+        let path_menu = |ui: &mut egui::Ui, gameinfo: bool, browse: &str, recent: &[PathBuf], action: &mut Option<HeaderAction>| {
+            let file = if gameinfo { "gameinfo.txt" } else { "studiomdl.exe" };
+            if ui.button(browse).clicked() {
+                *action = Some(HeaderAction::Browse(gameinfo));
+                ui.close();
+            }
+            ui.separator();
+            ui.label(RichText::new(format!("Recent {file}")).weak().small());
+            if recent.is_empty() {
+                ui.label(RichText::new("(none yet)").weak());
+            }
+            for p in recent {
+                let exists = p.is_file();
+                let r = ui.add_enabled(exists, egui::Button::new(p.display().to_string()));
+                let r = if exists { r.on_hover_text(format!("Switch to this {file}")) } else { r.on_disabled_hover_text("This file no longer exists") };
+                if r.clicked() {
+                    *action = Some(HeaderAction::Use(gameinfo, p.clone()));
+                    ui.close();
+                }
+            }
+            ui.separator();
+            if ui.add_enabled(!recent.is_empty(), egui::Button::new(format!("Clear recent {file}"))).clicked() {
+                *action = Some(HeaderAction::Clear(gameinfo));
+                ui.close();
+            }
+        };
         ui.horizontal_wrapped(|ui| {
             ui.label(RichText::new(&s.name).heading().color(accent));
             ui.separator();
             ui.label(RichText::new("gameinfo.txt:").weak());
-            ui.label(s.gameinfo.display().to_string());
+            let r = ui.add(egui::Label::new(s.gameinfo.display().to_string()).sense(egui::Sense::click())).on_hover_text("Right-click to replace or pick a recent one");
+            r.context_menu(|ui| path_menu(ui, true, "Replace gameinfo.txt...", &s.recent_gameinfo, &mut action));
             ui.separator();
             ui.label(RichText::new("studiomdl.exe:").weak());
-            match &s.studiomdl {
-                Some(p) => ui.label(p.display().to_string()),
-                None => ui.label(RichText::new("not set (needed for compiling only)").color(Color32::from_rgb(230, 150, 80))),
+            let text = match &s.studiomdl {
+                Some(p) => RichText::new(p.display().to_string()),
+                None => RichText::new("not set (needed for compiling only)").color(Color32::from_rgb(230, 150, 80)),
             };
+            let r = ui.add(egui::Label::new(text).sense(egui::Sense::click())).on_hover_text("Right-click to replace or pick a recent one");
+            let browse = if s.studiomdl.is_some() { "Replace studiomdl.exe..." } else { "Set studiomdl.exe..." };
+            r.context_menu(|ui| path_menu(ui, false, browse, &s.recent_studiomdl, &mut action));
         });
+        if let Some(a) = action {
+            self.header_action(a);
+            return;
+        }
         ui.horizontal(|ui| {
             if self.mounting.is_some() {
                 ui.spinner();
@@ -295,7 +404,7 @@ impl GoldenStunstick {
                                 } else if dir.exists() {
                                     d.error = Some(format!("A session called '{name}' already exists."));
                                 } else {
-                                    let s = Session { name: name.clone(), dir, gameinfo: gi, studiomdl: (!sm.is_empty()).then(|| PathBuf::from(sm)) };
+                                    let s = Session { name: name.clone(), dir, gameinfo: gi, studiomdl: (!sm.is_empty()).then(|| PathBuf::from(sm)), ..Default::default() };
                                     let _ = self.shared.files.ensure();
                                     match s.save() {
                                         Ok(()) => create = Some(s),

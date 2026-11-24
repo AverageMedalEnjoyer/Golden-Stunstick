@@ -1,5 +1,5 @@
 > [!WARNING]
-> This program was and is being assited with AI, but is created specifically for me.
+> This program was and is being assisted with AI, but is created specifically for me.
 > You are free to use this and to modify its code without asking for permission.
 
 # Golden Stunstick
